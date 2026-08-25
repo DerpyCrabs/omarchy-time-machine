@@ -665,8 +665,15 @@ key_save_to_1password() {
   command -v op >/dev/null 2>&1 ||
     die "the 1Password CLI is not installed. See https://developer.1password.com/docs/cli/"
 
-  timeout 15 op whoami >/dev/null 2>&1 ||
-    die "1Password is not signed in. Run: eval \$(op signin)"
+  # Not `op whoami`. With the desktop app integration there is no CLI session
+  # token, so whoami reports "not signed in" while everything else works fine.
+  # Listing vaults is the cheapest call that actually exercises the connection,
+  # and it is the one that raises the unlock prompt if there is going to be one.
+  local vault_check
+  if ! vault_check="$(timeout 60 op vault list --format=json 2>&1)"; then
+    printf '%s\n' "$vault_check" >&2
+    die "1Password did not respond. Sign in, or enable the CLI in the desktop app under Developer."
+  fi
 
   user_file "$keyfile" ||
     die "no key file at $keyfile — run: omarchy-time-machine key set --dest $DEST_NAME"
@@ -695,8 +702,10 @@ Without this password the backup cannot be opened. Not by you, not by anyone."
     '{title: $title,
       category: "PASSWORD",
       fields: [{id: "password", type: "CONCEALED", purpose: "PASSWORD",
-                label: "password", value: $password}],
-      notesPlain: $notes}')" || die "could not build the 1Password item"
+                label: "password", value: $password},
+               {id: "notesPlain", type: "STRING", purpose: "NOTES",
+                label: "notesPlain", value: $notes}]}')" ||
+    die "could not build the 1Password item"
 
   printf '%s' "$template" | timeout 30 op item create ${vault_args+"${vault_args[@]}"} - >/dev/null ||
     die "1Password refused to create the item"
@@ -719,7 +728,7 @@ cmd_key() {
   [ -n "$path" ] || path="$CONFIG_DIR/$DEST_NAME.key"
 
   case "$action" in
-    save)
+    save-1password)
       key_save_to_1password "$path"
       ;;
     set)
@@ -758,7 +767,7 @@ cmd_key() {
       cat -- "$path"
       ;;
     *)
-      die "usage: key set|show|save --dest <name>"
+      die "usage: key set|show|save-1password --dest <name>"
       ;;
   esac
 }
@@ -1840,7 +1849,7 @@ omarchy-time-machine $VERSION
   status --json                       status of every destination (no network)
   destinations [--json]               list every destination and when it last ran
   key set|show --dest <name>          manage the repository password
-  key save --dest <name> [--vault V]  copy it into 1Password
+  key save-1password --dest <name>    copy it into 1Password, optionally --vault V
   init --dest <name>                  create the repository
   backup [--dest <name>] [--dry-run]  run a backup
   snapshots --dest <name> --json      list snapshots

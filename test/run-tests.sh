@@ -353,7 +353,7 @@ mkdir -p "$WORK/stub"
 cat > "$WORK/stub/op" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "whoami ") exit 0 ;;
+  "vault list") echo '[{"name":"Private"}]' ;;
   "item get") exit 1 ;;
   "item create") printf '%s' "$*" > "$OP_ARGV"; cat > "$OP_CAPTURE"; exit 0 ;;
 esac
@@ -362,7 +362,7 @@ chmod +x "$WORK/stub/op"
 
 jq '.destinations[0].repository = "sftp:me:hunter2@nas:/volume1/backup"' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
 OP_ARGV="$WORK/op-argv" OP_CAPTURE="$WORK/op-stdin" PATH="$WORK/stub:$PATH" \
-  $CLI key save --dest test >/dev/null 2>&1
+  $CLI key save-1password --dest test >/dev/null 2>&1
 
 grep -q "test-password" "$WORK/op-argv" 2>/dev/null && false || true
 check $? "the key never appears in op's arguments"
@@ -377,14 +377,14 @@ check $? "and the note names the destination without its password"
 # that can sit waiting on an authentication prompt is worse than one that stops.
 cat > "$WORK/stub/op" <<'STUB'
 #!/usr/bin/env bash
-[ "$1" = "whoami" ] && exit 1
+[ "$1" = "vault" ] && { echo "not signed in" >&2; exit 1; }
 sleep 300
 STUB
 chmod +x "$WORK/stub/op"
 START="$(date +%s)"
-PATH="$WORK/stub:$PATH" $CLI key save --dest test >/dev/null 2>&1
+PATH="$WORK/stub:$PATH" $CLI key save-1password --dest test >/dev/null 2>&1
 [ "$(( $(date +%s) - START ))" -lt 5 ]
-check $? "a signed-out 1Password fails fast instead of hanging"
+check $? "a 1Password that will not answer fails fast instead of hanging"
 
 cp "$WORK/config.bak" "$CONFIG"
 

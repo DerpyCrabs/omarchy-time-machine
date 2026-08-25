@@ -80,7 +80,7 @@ Put that in your password manager. Print it and put it in a drawer. Do it today,
 If you use 1Password, there's a shortcut:
 
 ```bash
-omarchy-time-machine key save --dest backup-drive
+omarchy-time-machine key save-1password --dest backup-drive
 ```
 
 That writes it into your vault as "Time Machine backup key (backup-drive)", with a note saying which destination it opens. It refuses if an item by that name already exists, because two of them is how you end up trying the wrong one in a year.
