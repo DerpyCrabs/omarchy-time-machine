@@ -340,6 +340,74 @@ jq -e '.destinations.test.last_success_at != null and .destinations.test.last_ru
 check $? "a failed run keeps the previous last_success_at"
 cp "$WORK/config.bak" "$CONFIG"
 
+# --- saving the key to 1Password -------------------------------------------
+#
+# Stubbed, because a test suite has no business touching somebody's vault. What
+# is under test is the part that can leak: the secret must reach op on stdin,
+# never as an argument, and the note that goes with it must not carry a
+# password of its own.
+
+group "Saving the key to 1Password"
+
+mkdir -p "$WORK/stub"
+cat > "$WORK/stub/op" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "whoami ") exit 0 ;;
+  "item get") exit 1 ;;
+  "item create") printf '%s' "$*" > "$OP_ARGV"; cat > "$OP_CAPTURE"; exit 0 ;;
+esac
+STUB
+chmod +x "$WORK/stub/op"
+
+jq '.destinations[0].repository = "sftp:me:hunter2@nas:/volume1/backup"' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+OP_ARGV="$WORK/op-argv" OP_CAPTURE="$WORK/op-stdin" PATH="$WORK/stub:$PATH" \
+  $CLI key save --dest test >/dev/null 2>&1
+
+grep -q "test-password" "$WORK/op-argv" 2>/dev/null && false || true
+check $? "the key never appears in op's arguments"
+
+jq -e '.fields[0].value == "test-password"' "$WORK/op-stdin" >/dev/null 2>&1
+check $? "it travels on stdin inside the item template"
+
+grep -q "hunter2" "$WORK/op-stdin" 2>/dev/null && false || true
+check $? "and the note names the destination without its password"
+
+# op that is present but not signed in must fail immediately. A backup tool
+# that can sit waiting on an authentication prompt is worse than one that stops.
+cat > "$WORK/stub/op" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = "whoami" ] && exit 1
+sleep 300
+STUB
+chmod +x "$WORK/stub/op"
+START="$(date +%s)"
+PATH="$WORK/stub:$PATH" $CLI key save --dest test >/dev/null 2>&1
+[ "$(( $(date +%s) - START ))" -lt 5 ]
+check $? "a signed-out 1Password fails fast instead of hanging"
+
+cp "$WORK/config.bak" "$CONFIG"
+
+# --- listing destinations ---------------------------------------------------
+
+group "Listing destinations"
+
+OUT="$($CLI destinations 2>&1)"
+grep -q "NAME" <<<"$OUT" && grep -q "test" <<<"$OUT"
+check $? "destinations prints a readable table by default"
+
+# Reads config and the local state file only. Somebody checking what they have
+# should not have to wait on a sleeping NAS, or plug the drive back in.
+jq '.destinations[0].repository = "sftp:nobody@203.0.113.1:/nowhere"' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+START="$(date +%s)"
+$CLI destinations >/dev/null 2>&1
+[ "$(( $(date +%s) - START ))" -lt 3 ]
+check $? "and answers instantly with an unreachable destination"
+cp "$WORK/config.bak" "$CONFIG"
+
+$CLI destinations --json | jq -e '.ok == true' >/dev/null 2>&1
+check $? "--json still gives the widget its machine-readable form"
+
 # --- a broken configuration ------------------------------------------------
 #
 # A config that exists but is wrong used to be indistinguishable from one that

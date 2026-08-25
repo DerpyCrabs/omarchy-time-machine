@@ -255,11 +255,13 @@ OPT_DEST=""
 OPT_SNAPSHOT=""
 OPT_PATH=""
 OPT_TARGET=""
+OPT_VAULT=""
 OPT_DRY_RUN=0
+OPT_JSON=0
 declare -a POSITIONAL=()
 
 parse_options() {
-  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_DRY_RUN=0
+  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_VAULT=""; OPT_DRY_RUN=0; OPT_JSON=0
   POSITIONAL=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -267,8 +269,9 @@ parse_options() {
       --snapshot) OPT_SNAPSHOT="${2:-}"; shift 2 || shift ;;
       --path) OPT_PATH="${2:-}"; shift 2 || shift ;;
       --target) OPT_TARGET="${2:-}"; shift 2 || shift ;;
+      --vault) OPT_VAULT="${2:-}"; shift 2 || shift ;;
       --dry-run) OPT_DRY_RUN=1; shift ;;
-      --json) shift ;;
+      --json) OPT_JSON=1; shift ;;
       *) POSITIONAL+=("$1"); shift ;;
     esac
   done
@@ -440,7 +443,8 @@ substitute_vars() {
 sanitize_repository() {
   printf '%s' "$1" | sed -E '
     s#//([^/@:[:space:]]+):[^/@[:space:]]*@#//\1@#g;
-    s#//:[^/@[:space:]]*@#//#g'
+    s#//:[^/@[:space:]]*@#//#g;
+    s#^([a-z0-9+.-]+:)([^/@:[:space:]]+):[^/@[:space:]]*@#\1\2@#'
 }
 
 # Exports everything restic needs. Values go into the environment, never into
@@ -643,6 +647,64 @@ manager, on paper, or on another host.
 TEXT
 }
 
+# Copies the repository password into 1Password, which is the "somewhere else"
+# the warning above keeps going on about.
+#
+# The secret travels on stdin inside a JSON template, never as an argument.
+# 1Password's own documentation says the same thing: assignment statements like
+# password=hunter2 end up in the process list, where every account on the
+# machine can read them.
+#
+# Every op call is wrapped in a timeout. An unauthenticated op sits and waits
+# for input, and a backup tool that can hang on a prompt is worse than one that
+# refuses.
+key_save_to_1password() {
+  local keyfile="$1"
+  local title item vault_args=() existing notes template
+
+  command -v op >/dev/null 2>&1 ||
+    die "the 1Password CLI is not installed. See https://developer.1password.com/docs/cli/"
+
+  timeout 15 op whoami >/dev/null 2>&1 ||
+    die "1Password is not signed in. Run: eval \$(op signin)"
+
+  user_file "$keyfile" ||
+    die "no key file at $keyfile — run: omarchy-time-machine key set --dest $DEST_NAME"
+
+  title="Time Machine backup key ($DEST_NAME)"
+  [ -n "$OPT_VAULT" ] && vault_args=(--vault "$OPT_VAULT")
+
+  # Refuse rather than overwrite or duplicate. Two items with the same name is
+  # how you end up restoring with the wrong key a year from now.
+  if existing="$(timeout 20 op item get "$title" --format=json ${vault_args+"${vault_args[@]}"} 2>/dev/null)" &&
+     [ -n "$existing" ]; then
+    die "1Password already has an item called \"$title\". Delete or rename it first."
+  fi
+
+  notes="Repository password for the Time Machine destination \"$DEST_NAME\".
+
+Destination: $(sanitize_repository "$(dest '.repository // empty')")
+Saved from: $(hostname 2>/dev/null || printf 'unknown host')
+
+Without this password the backup cannot be opened. Not by you, not by anyone."
+
+  template="$(jq -n \
+    --arg title "$title" \
+    --arg password "$(cat -- "$keyfile")" \
+    --arg notes "$notes" \
+    '{title: $title,
+      category: "PASSWORD",
+      fields: [{id: "password", type: "CONCEALED", purpose: "PASSWORD",
+                label: "password", value: $password}],
+      notesPlain: $notes}')" || die "could not build the 1Password item"
+
+  printf '%s' "$template" | timeout 30 op item create ${vault_args+"${vault_args[@]}"} - >/dev/null ||
+    die "1Password refused to create the item"
+
+  printf 'Saved to 1Password as "%s".\n' "$title"
+  printf 'That is the copy that survives losing this machine.\n'
+}
+
 cmd_key() {
   local action="${1:-}"
   [ "$#" -gt 0 ] && shift
@@ -657,6 +719,9 @@ cmd_key() {
   [ -n "$path" ] || path="$CONFIG_DIR/$DEST_NAME.key"
 
   case "$action" in
+    save)
+      key_save_to_1password "$path"
+      ;;
     set)
       [ -z "$(dest '.password_command // empty')" ] ||
         die "destination $DEST_NAME uses password_command; a key file would do nothing there"
@@ -693,12 +758,67 @@ cmd_key() {
       cat -- "$path"
       ;;
     *)
-      die "usage: key set|show --dest <name>"
+      die "usage: key set|show|save --dest <name>"
       ;;
   esac
 }
 
+# Everything worth knowing about every destination, without touching one of
+# them. Reads the configuration and the local state file only, so it answers
+# instantly whether or not the disk is plugged in or the NAS is awake.
+destinations_table() {
+  load_config
+
+  local status name label repo schedule last size snaps units
+  status="$(load_status)"
+
+  units="no"
+  readable_file "$SYSTEMD_DIR/omarchy-time-machine@.service" && units="yes"
+
+  printf '%-14s %-22s %-38s %-14s %s\n' NAME LABEL WHERE SCHEDULE "LAST BACKUP"
+  printf '%-14s %-22s %-38s %-14s %s\n' -------------- ---------------------- \
+    -------------------------------------- -------------- -----------
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    select_destination "$name"
+    label="$(dest_label)"
+    repo="$(sanitize_repository "$(dest '.repository // empty')")"
+    schedule="$(dest '.schedule // empty')"
+    [ -n "$schedule" ] || schedule="on request"
+
+    last="$(jq -r --arg n "$name" '
+      .destinations[$n].last_run // {} |
+      if .finished_at then
+        (.finished_at | sub("T"; " ") | .[0:16]) + (if .result == "failed" then "  FAILED" else "" end)
+      else "never" end' <<<"$status" 2>/dev/null)"
+    [ -n "$last" ] || last="never"
+
+    # Truncate rather than wrap: a table that reflows is harder to scan than
+    # one that loses the middle of a long URL you already know.
+    [ "${#repo}" -gt 38 ] && repo="${repo:0:35}..."
+    [ "${#label}" -gt 22 ] && label="${label:0:19}..."
+
+    printf '%-14s %-22s %-38s %-14s %s\n' "$name" "$label" "$repo" "$schedule" "$last"
+  done < <(cfg '.destinations[].name')
+
+  size="$(jq -r '[.destinations[] | .repo_size_bytes // 0] | add // 0' <<<"$status" 2>/dev/null)"
+  snaps="$(jq -r '[.destinations[] | .snapshot_count // 0] | add // 0' <<<"$status" 2>/dev/null)"
+  if [ "$(number_or "$snaps" 0)" -gt 0 ]; then
+    printf '\n%s snapshots, %s stored in total\n' "$snaps" \
+      "$(jq -rn --argjson b "$(number_or "$size" 0)" '
+        ($b / 1073741824) | if . >= 100 then (. | round | tostring) else (. * 10 | round / 10 | tostring) end
+        | . + " GB"')"
+  fi
+
+  [ "$units" = "yes" ] || printf '\nNothing is scheduled yet. Run: omarchy-time-machine install\n'
+  return 0
+}
+
 cmd_destinations() {
+  parse_options "$@"
+  [ "$OPT_JSON" = "1" ] || { destinations_table; return $?; }
+
   JSON_MODE=1
   demo_on && { demo_destinations_json; return 0; }
   load_config
@@ -1718,8 +1838,9 @@ usage() {
 omarchy-time-machine $VERSION
 
   status --json                       status of every destination (no network)
-  destinations --json                 configured destinations
+  destinations [--json]               list every destination and when it last ran
   key set|show --dest <name>          manage the repository password
+  key save --dest <name> [--vault V]  copy it into 1Password
   init --dest <name>                  create the repository
   backup [--dest <name>] [--dry-run]  run a backup
   snapshots --dest <name> --json      list snapshots

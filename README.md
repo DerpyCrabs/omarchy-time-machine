@@ -77,6 +77,14 @@ omarchy-time-machine key show --dest backup-drive
 
 Put that in your password manager. Print it and put it in a drawer. Do it today, because the moment you need it is exactly the moment you can't get to it.
 
+If you use 1Password, there's a shortcut:
+
+```bash
+omarchy-time-machine key save --dest backup-drive
+```
+
+That writes it into your vault as "Time Machine backup key (backup-drive)", with a note saying which destination it opens. It refuses if an item by that name already exists, because two of them is how you end up trying the wrong one in a year.
+
 ## Getting files back
 
 Open the panel and hit **Restore Files**. Pick a day, then browse to whatever you're looking for, the same way you'd browse any folder.
@@ -133,6 +141,20 @@ systemctl --user list-timers 'omarchy-time-machine@*'  # when does it run next
 omarchy-time-machine backup --dest backup-drive --dry-run    # test everything, write nothing
 omarchy-time-machine check --dest backup-drive               # verify the backup isn't damaged
 ```
+
+To see what you have set up and when each one last ran:
+
+```
+$ omarchy-time-machine destinations
+NAME           LABEL                  WHERE                                  SCHEDULE       LAST BACKUP
+nas            Synology in the cup... sftp:me@nas:/volume1/backup            *-*-* 03:00:00 2026-08-25 03:07
+usb            Drive in my bag        /run/media/me/backup/restic            on request     2026-08-18 06:50
+offsite        Offsite                s3:s3.eu-central-1.amazonaws.com/attic *-*-* 04:30:00 never
+
+35 snapshots, 373 GB stored in total
+```
+
+That reads your settings and one local file, nothing else, so it answers straight away whether or not the drive is plugged in.
 
 You can drive the whole thing from the terminal if you prefer. `omarchy-time-machine` on its own lists what it can do.
 
