@@ -1,0 +1,1762 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# omarchy-time-machine — restic backups with a bar widget on top.
+#
+# This is the only place that touches restic, systemd and the state files; the
+# QML widget does nothing but call this script and read JSON. That split is
+# deliberate: showing "3 hours ago" must never need a password, a network round
+# trip or a sleeping NAS, and that only holds if the widget reads status.json
+# and nothing else.
+#
+#   omarchy-time-machine status --json         status of every destination
+#   omarchy-time-machine destinations --json   configured destinations
+#   omarchy-time-machine use <name>            pick the active destination
+#   omarchy-time-machine key set --dest N      read the repo password from stdin
+#   omarchy-time-machine key show --dest N     print it, to store it elsewhere
+#   omarchy-time-machine init --dest N         create the repository, once
+#   omarchy-time-machine backup [--dest N] [--dry-run]
+#   omarchy-time-machine snapshots --dest N --json
+#   omarchy-time-machine ls --dest N --snapshot ID --path /abs --json
+#   omarchy-time-machine restore --dest N --snapshot ID --path P [--target DIR]
+#   omarchy-time-machine check --dest N
+#   omarchy-time-machine install               write and enable the systemd units
+#   omarchy-time-machine log [--dest N]
+#
+# Dependencies: bash, jq, restic. jq ships as a hard dependency of Omarchy
+# itself, so nothing here needs installing beyond restic. Deliberately not Ruby
+# or Python: neither is guaranteed on an Omarchy box, and where a version
+# manager owns them the binary sits outside the PATH a systemd unit gets --
+# which would break the nightly run silently.
+#
+# Secrets: the repository password travels through RESTIC_PASSWORD_FILE or
+# restic's own --password-command, never as an argument. /proc/PID/cmdline is
+# 0444 and readable by every account on the machine; /proc/PID/environ is 0400,
+# which makes the environment an acceptable route for the repository URL -- and
+# for a rest-server that URL carries the credentials. It is also the only way
+# restic accepts them.
+#
+# Timestamps are stored twice: an ISO string for display and an epoch number
+# for arithmetic. jq's fromdateiso8601 only accepts the trailing-Z form and
+# rejects the "+02:00" that `date -Iseconds` produces, so anything computed
+# from a parsed date would fail -- silently, in the case of the staleness check.
+
+set -uo pipefail
+umask 077
+
+VERSION="1.0.0"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-time-machine"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-time-machine"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+STATUS_FILE="$STATE_DIR/status.json"
+LOG_ROOT="$STATE_DIR/logs"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+LOG_RETENTION_DAYS=30
+PRE_COMMAND_TIMEOUT=60
+LS_ENTRY_CAP=500
+PROGRESS_INTERVAL_MS=500
+STALE_PROGRESS_SECONDS=10
+
+SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+PLUGIN_DIR="$(dirname -- "$(dirname -- "$SELF")")"
+
+# Shipped with the plugin rather than named from the icon theme: the generic
+# dialog-* names resolve to a 16x16 legacy bitmap on a stock Arch install, and
+# arrive in the notification upscaled and blurry.
+icon_for() {
+  # Separate statements: bash expands every argument of `local` before making
+  # any of the assignments, so `path="$DIR/$name.svg"` on the same line would
+  # read $name while it is still empty -- and quietly resolve to "$DIR/.svg",
+  # which exists nowhere, so every notification would fall back.
+  local name="$1"
+  local fallback="${2:-dialog-information}"
+  local path="$PLUGIN_DIR/$name.svg"
+  if readable_file "$path"; then printf '%s' "$path"; else printf '%s' "$fallback"; fi
+}
+
+# Set by commands that produce machine-readable output, so die() can answer in
+# JSON instead of dumping a message QML cannot tell apart from a crash.
+JSON_MODE=0
+SUMMARY_FILE=""
+ERROR_FILE=""
+
+# die() must only ever be called from the main shell, never from inside a
+# command substitution: there it would exit the subshell and the caller would
+# sail on with an empty string. Functions that can fail therefore write their
+# result into a global rather than printing it.
+die() {
+  if [ "$JSON_MODE" = "1" ]; then
+    jq -nc --arg e "$*" '{ok:false, error:$e}'
+    exit 0
+  fi
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"; }
+
+# Every notification goes through here, so one variable can silence the lot.
+# The test suite sets it: a run of the suite was firing real sticky
+# notifications onto a real desktop, which somebody then had to dismiss by
+# hand. Tests get to touch a throwaway directory, not your screen.
+notify() {
+  [ -n "${OMARCHY_TIME_MACHINE_QUIET:-}" ] && return 0
+  notify-send "$@" >/dev/null 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# File safety
+#
+# All of this comes from the marketplace security baseline. The repair runs
+# unconditionally: a directory's mode says nothing about the mode of the files
+# inside it, and a directory that was once wider open may hold entries this
+# script never put there -- a symlink sitting on the fixed name of a state file
+# sends every write to a file somebody else chose. Hence non-regular entries
+# are removed, not merely chmod'ed.
+# ---------------------------------------------------------------------------
+
+# Two kinds of "exists and is readable", and the difference matters.
+#
+# readable_file is strict -- a symlink is refused -- and is for paths *we* own
+# and write: state, progress, the summary scratch file. There an unexpected
+# symlink is somebody redirecting our writes.
+#
+# user_file follows symlinks, and is for paths the *user* named in their own
+# configuration: the exclude file, config.json itself, an explicitly
+# configured password or secrets file. Dotfiles managed with stow are symlinks
+# by design, and refusing them would break an entirely ordinary setup for no
+# security gain: we only ever read these, and every write in this script goes
+# through write_private, which replaces the path rather than following it.
+readable_file() { [ -f "$1" ] && [ ! -L "$1" ]; }
+user_file() { [ -f "$1" ]; }
+
+# $2.. are subdirectory names that belong here (logs/) and must survive the
+# sweep. Anything else that is not a plain file is removed.
+# Only ever called on STATE_DIR. The config directory gets config_dir_secure
+# instead: sweeping it would delete a config.json that the user stowed there
+# from their dotfiles, and that loss would be far worse than the threat the
+# sweep defends against -- which write_private already handles by replacing
+# paths instead of following them.
+private_dir() {
+  local dir="$1"; shift
+  local keep=("$@") owner entry base skip k
+
+  mkdir -p -m 700 -- "$dir" 2>/dev/null
+  { [ -d "$dir" ] && [ ! -L "$dir" ]; } || die "$dir is a symlink or not a directory"
+  owner="$(stat -c '%u' -- "$dir" 2>/dev/null)" || die "cannot stat $dir"
+  [ "$owner" = "$(id -u)" ] || die "$dir is owned by someone else"
+  chmod 700 -- "$dir" 2>/dev/null || die "cannot chmod $dir"
+
+  shopt -s nullglob dotglob
+  for entry in "$dir"/*; do
+    base="$(basename -- "$entry")"
+    if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+      chmod 600 -- "$entry" 2>/dev/null
+      continue
+    fi
+    skip=0
+    for k in ${keep+"${keep[@]}"}; do
+      if [ "$base" = "$k" ] && [ -d "$entry" ] && [ ! -L "$entry" ]; then skip=1; fi
+    done
+    [ "$skip" = "1" ] && continue
+    rm -rf -- "$entry" 2>/dev/null
+  done
+  shopt -u nullglob dotglob
+  return 0
+}
+
+# The user's own directory: make sure it is private and that anything holding a
+# secret is 600, but never remove what is in it.
+config_dir_secure() {
+  local entry owner
+  mkdir -p -m 700 -- "$CONFIG_DIR" 2>/dev/null
+  { [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ]; } || die "$CONFIG_DIR is a symlink or not a directory"
+  owner="$(stat -c '%u' -- "$CONFIG_DIR" 2>/dev/null)" || die "cannot stat $CONFIG_DIR"
+  [ "$owner" = "$(id -u)" ] || die "$CONFIG_DIR is owned by someone else"
+  chmod 700 -- "$CONFIG_DIR" 2>/dev/null
+
+  shopt -s nullglob
+  for entry in "$CONFIG_DIR"/*.key "$CONFIG_DIR"/*.env "$CONFIG_DIR"/config.json; do
+    [ -f "$entry" ] && [ ! -L "$entry" ] && chmod 600 -- "$entry" 2>/dev/null
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# Write through a temporary file and rename: that replaces the path itself, not
+# whatever the path points at. A bare `>` follows a symlink already there.
+write_private() {
+  local dest="$1" tmp
+  mkdir -p -m 700 -- "$(dirname -- "$dest")" 2>/dev/null
+  tmp="$(mktemp -- "$dest.XXXXXX")" || return 1
+  chmod 600 -- "$tmp" 2>/dev/null
+  if ! cat > "$tmp"; then rm -f -- "$tmp"; return 1; fi
+  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+}
+
+# A cache file must never be able to break the script: jq refuses invalid JSON
+# and would take the whole run down with it, not just the lookup that needed
+# the file. Fall back to the given default instead.
+read_json_or() {
+  local path="$1" fallback="$2"
+  if readable_file "$path" && jq -e . -- "$path" >/dev/null 2>&1; then
+    cat -- "$path"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+expand_tilde() {
+  local value="$1"
+  case "$value" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s' "$HOME/${value#\~/}" ;;
+    *) printf '%s' "$value" ;;
+  esac
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# Bash re-evaluates the *contents* of a name inside $(( )), and an array
+# subscript there is a command substitution. Anything that came from restic, a
+# config file or the network goes through this first.
+number_or() {
+  local value="$1" fallback="$2"
+  case "$value" in ''|*[!0-9]*) printf '%s' "$fallback"; return 0 ;; esac
+  [ "${#value}" -le 12 ] || { printf '%s' "$fallback"; return 0; }
+  printf '%s' "$((10#$value))"
+}
+
+now_ms() {
+  local seconds nanos
+  seconds="$(date +%s)"
+  nanos="$(date +%N)"
+  nanos="$(number_or "$nanos" 0)"
+  printf '%s' "$(( seconds * 1000 + nanos / 1000000 ))"
+}
+
+# ---------------------------------------------------------------------------
+# Option parsing
+#
+# Deliberately not a helper that echoes its result: a command substitution runs
+# in a subshell, so it could neither hand back the remaining arguments nor let
+# die() stop the run.
+# ---------------------------------------------------------------------------
+
+OPT_DEST=""
+OPT_SNAPSHOT=""
+OPT_PATH=""
+OPT_TARGET=""
+OPT_DRY_RUN=0
+declare -a POSITIONAL=()
+
+parse_options() {
+  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_DRY_RUN=0
+  POSITIONAL=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dest) OPT_DEST="${2:-}"; shift 2 || shift ;;
+      --snapshot) OPT_SNAPSHOT="${2:-}"; shift 2 || shift ;;
+      --path) OPT_PATH="${2:-}"; shift 2 || shift ;;
+      --target) OPT_TARGET="${2:-}"; shift 2 || shift ;;
+      --dry-run) OPT_DRY_RUN=1; shift ;;
+      --json) shift ;;
+      *) POSITIONAL+=("$1"); shift ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CONFIG_JSON=""
+DEST_JSON=""
+DEST_NAME=""
+
+# Checks a configuration and prints what is wrong with it, if anything. Kept
+# separate from load_config on purpose: die() exits 0 under --json so that QML
+# gets a clean {"ok":false} instead of a crash, which means a caller cannot use
+# the exit status to tell "broken" from "fine". This can.
+config_problem() {
+  local json="$1"
+
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$json" || {
+    printf '%s' "config.json is not valid JSON, or not an object"; return 1; }
+  jq -e '(.destinations | type) == "array" and (.destinations | length) > 0' >/dev/null 2>&1 <<<"$json" || {
+    printf '%s' "config.json has no destinations list"; return 1; }
+
+  local problem
+  problem="$(jq -r '
+    [.destinations[] | .name] as $names
+    | ($names | map(select(type == "string" and (test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))))) as $valid
+    | if ($names | length) != ($valid | length)
+      then "every destination needs a name (letters, digits, . _ - allowed). Note that display_name is a label, not a replacement for it."
+      elif ($names | length) != ($names | unique | length)
+      then "duplicate destination names: " + (($names | group_by(.) | map(select(length > 1) | .[0])) | join(", "))
+      else "" end' <<<"$json" 2>/dev/null)"
+
+  [ -z "$problem" ] && return 0
+  printf '%s' "$problem"
+  return 1
+}
+
+load_config() {
+  user_file "$CONFIG_FILE" ||
+    die "no configuration at $CONFIG_FILE — create one (see the README) or use the button in the panel"
+
+  CONFIG_JSON="$(cat -- "$CONFIG_FILE")"
+
+  local problem
+  problem="$(config_problem "$CONFIG_JSON")" || die "$problem"
+  return 0
+}
+
+cfg() { jq -r "$1" <<<"$CONFIG_JSON"; }
+
+# Selects the destination and leaves it in DEST_JSON / DEST_NAME.
+select_destination() {
+  local wanted="${1:-}"
+  # No "active" destination any more: with several of them they all run on
+  # their own schedule and they all matter, so singling one out was a fiction
+  # the panel had to keep explaining. Without --dest, act on the first.
+  [ -n "$wanted" ] || wanted="$(cfg '.destinations[0].name')"
+
+  DEST_JSON="$(jq -c --arg n "$wanted" '.destinations[] | select(.name == $n)' <<<"$CONFIG_JSON")"
+  [ -n "$DEST_JSON" ] ||
+    die "unknown destination \"$wanted\"; available: $(cfg '[.destinations[].name] | join(", ")')"
+  DEST_NAME="$wanted"
+}
+
+dest() { jq -r "$1" <<<"$DEST_JSON"; }
+
+# What a human sees. `name` is an identifier -- it names the key file, the
+# systemd unit and the log directory -- so it is deliberately restricted to a
+# safe character set. display_name carries no such constraint and is free to
+# say "NAS in the meter cupboard".
+dest_label() {
+  local label
+  label="$(dest '.display_name // empty')"
+  [ -n "$label" ] || label="$DEST_NAME"
+  printf '%s' "$label"
+}
+
+# Per-destination retention overrides the global block, which overrides these.
+keep_value() {
+  local key="$1" fallback="$2" value
+  value="$(jq -r --arg k "$key" '.retention[$k] // empty' <<<"$DEST_JSON" 2>/dev/null)"
+  [ -n "$value" ] || value="$(jq -r --arg k "$key" '.retention[$k] // empty' <<<"$CONFIG_JSON" 2>/dev/null)"
+  number_or "$value" "$fallback"
+}
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+
+declare -A SECRETS=()
+
+# KEY=VALUE lines, parsed and never eval'ed: this file must not be able to
+# execute code, not even when somebody pastes it in from the internet.
+load_secrets() {
+  local path key value line lineno=0
+  path="$(expand_tilde "$(dest '.secrets_file // empty')")"
+  [ -n "$path" ] || path="$CONFIG_DIR/$DEST_NAME.env"
+  SECRETS=()
+  user_file "$path" || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line="$(trim "$line")"
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac
+    case "$line" in "export "*) line="${line#export }" ;; esac
+
+    key="${line%%=*}"
+    [ "$key" = "$line" ] && die "$path:$lineno is not a KEY=VALUE line"
+    value="${line#*=}"
+    key="$(trim "$key")"
+    value="$(trim "$value")"
+
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "$path:$lineno has an invalid variable name \"$key\""
+
+    if [ "${#value}" -ge 2 ]; then
+      case "$value" in
+        \"*\") value="${value:1:${#value}-2}" ;;
+        \'*\') value="${value:1:${#value}-2}" ;;
+      esac
+    fi
+    SECRETS["$key"]="$value"
+  done < "$path"
+  return 0
+}
+
+# Replaces ${NAME} with the value from the .env file. Result lands in
+# SUBST_RESULT rather than on stdout, so a missing variable can stop the run
+# instead of quietly yielding an empty URL. Iterative and capped: a secret
+# whose value happens to contain ${...} must not send this into a loop.
+SUBST_RESULT=""
+SUBST_MISSING=""
+substitute_vars() {
+  local input="$1" strict="${2:-1}" var rounds=0
+  SUBST_MISSING=""
+  while [[ "$input" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    rounds=$((rounds + 1))
+    if [ "$rounds" -gt 32 ]; then
+      SUBST_MISSING="too many substitutions"
+      [ "$strict" = "1" ] && die "too many \${...} substitutions in the repository URL"
+      break
+    fi
+    var="${BASH_REMATCH[1]}"
+    if [ -z "${SECRETS[$var]+isset}" ]; then
+      SUBST_MISSING="$var"
+      [ "$strict" = "1" ] &&
+        die "the repository of $DEST_NAME refers to \${$var}, but that is not set in $CONFIG_DIR/$DEST_NAME.env"
+      input="${input//\$\{$var\}/}"
+      continue
+    fi
+    input="${input//\$\{$var\}/${SECRETS[$var]}}"
+  done
+  SUBST_RESULT="$input"
+  return 0
+}
+
+# What ends up in status.json and in the UI: the password removed, the username
+# kept. Redacting the user as well would be safer only in appearance -- a
+# username is not a secret, and dropping it makes an sftp destination
+# indistinguishable from anyone else's on the same host.
+#
+# Mind the shape of restic URLs: `rest:http://user:pass@host/` carries two
+# schemes back to back, so anchoring at the start of the string does not work.
+# `sftp:user@host:/path` has no `//` at all and can never carry a password,
+# since restic authenticates it over SSH.
+sanitize_repository() {
+  printf '%s' "$1" | sed -E '
+    s#//([^/@:[:space:]]+):[^/@[:space:]]*@#//\1@#g;
+    s#//:[^/@[:space:]]*@#//#g'
+}
+
+# Exports everything restic needs. Values go into the environment, never into
+# argv. RESTIC_ARGS holds only non-secret flags.
+declare -a RESTIC_ARGS=()
+REPO_DISPLAY=""
+
+restic_context() {
+  local repository password_file password_command key
+
+  load_secrets
+  for key in ${!SECRETS[@]+"${!SECRETS[@]}"}; do
+    export "$key=${SECRETS[$key]}"
+  done
+
+  repository="$(dest '.repository // empty')"
+  [ -n "$repository" ] || die "destination $DEST_NAME has no repository URL"
+  substitute_vars "$repository" 1
+  export RESTIC_REPOSITORY="$SUBST_RESULT"
+  REPO_DISPLAY="$(sanitize_repository "$SUBST_RESULT")"
+
+  password_file="$(expand_tilde "$(dest '.password_file // empty')")"
+  password_command="$(dest '.password_command // empty')"
+  RESTIC_ARGS=()
+
+  if [ -n "$password_file" ] && [ -n "$password_command" ]; then
+    die "destination $DEST_NAME sets both password_file and password_command; pick one (silently choosing would mask a half-finished migration)"
+  fi
+
+  if [ -n "$password_command" ]; then
+    # restic runs this itself, so the password never reaches our argv.
+    RESTIC_ARGS=(--password-command "$password_command")
+    return 0
+  fi
+
+  [ -n "$password_file" ] || password_file="$CONFIG_DIR/$DEST_NAME.key"
+  user_file "$password_file" ||
+    die "no key file at $password_file — run: omarchy-time-machine key set --dest $DEST_NAME"
+  chmod 600 -- "$password_file" 2>/dev/null
+  export RESTIC_PASSWORD_FILE="$password_file"
+  return 0
+}
+
+restic_run() { restic ${RESTIC_ARGS+"${RESTIC_ARGS[@]}"} "$@"; }
+
+# pre_command lives in the user's own configuration, so a shell string is as
+# legitimate here as restic's own --password-command. With a timeout, though: a
+# NAS that refuses to wake up must not hang the run forever.
+run_pre_command() {
+  local cmd status
+  cmd="$(dest '.pre_command // empty')"
+  [ -n "$cmd" ] || return 0
+
+  log_line "pre_command: $cmd"
+  timeout "$PRE_COMMAND_TIMEOUT" bash -c "$cmd" >&2
+  status=$?
+  [ "$status" = "0" ] && return 0
+  [ "$status" = "124" ] && die "pre_command of $DEST_NAME timed out (>${PRE_COMMAND_TIMEOUT}s)"
+  die "pre_command of $DEST_NAME failed (exit $status)"
+}
+
+# An interrupted run leaves a lock behind that the next run trips over. restic
+# unlock only removes locks it can prove are stale, which is safer than the PID
+# grep this script replaced.
+clear_stale_locks() {
+  local locks
+  locks="$(restic_run list locks 2>/dev/null)"
+  [ -n "$locks" ] || return 0
+  log_line "Locks present on the repository, clearing stale ones..."
+  if restic_run unlock >/dev/null 2>&1; then
+    log_line "Stale locks cleared."
+  else
+    log_line "Could not clear locks; a run may still be in progress."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Progress and status files
+# ---------------------------------------------------------------------------
+
+PROGRESS_FILE=""
+PROGRESS_KIND=""
+PROGRESS_UNIT=""
+PROGRESS_STARTED=0
+PROGRESS_LAST=0
+
+progress_init() {
+  PROGRESS_KIND="$1"
+  PROGRESS_UNIT="${2:-}"
+  PROGRESS_FILE="$STATE_DIR/progress-$DEST_NAME.json"
+  PROGRESS_STARTED="$(date +%s)"
+  PROGRESS_LAST=0
+}
+
+# progress_write <state> <phase> <force> [extra-json]
+progress_write() {
+  local state="$1" phase="$2" force="$3" extra="${4:-}" now elapsed epoch
+  [ -n "$extra" ] || extra='{}'
+  now="$(now_ms)"
+  if [ "$force" != "1" ] && [ $((now - PROGRESS_LAST)) -lt "$PROGRESS_INTERVAL_MS" ]; then
+    return 0
+  fi
+  PROGRESS_LAST="$now"
+  epoch="$(date +%s)"
+  elapsed=$((epoch - PROGRESS_STARTED))
+
+  jq -nc \
+    --arg state "$state" \
+    --arg kind "$PROGRESS_KIND" \
+    --arg phase "$phase" \
+    --arg unit "$PROGRESS_UNIT" \
+    --argjson elapsed "$elapsed" \
+    --argjson pid "$$" \
+    --arg updated "$(date -Iseconds)" \
+    --argjson updated_epoch "$epoch" \
+    --argjson extra "$extra" \
+    '{state:$state, kind:$kind, phase:$phase, seconds_elapsed:$elapsed,
+      unit:(if $unit == "" then null else $unit end), pid:$pid,
+      updated_at:$updated, updated_epoch:$updated_epoch}
+     + $extra' | write_private "$PROGRESS_FILE"
+  return 0
+}
+
+load_status() {
+  read_json_or "$STATUS_FILE" '{"version":1,"destinations":{}}'
+}
+
+# ---------------------------------------------------------------------------
+# Log files
+# ---------------------------------------------------------------------------
+
+LOG_FILE=""
+
+open_log() {
+  local dir="$LOG_ROOT/$DEST_NAME"
+  mkdir -p -m 700 -- "$dir"
+  LOG_FILE="$dir/$(date +%Y-%m-%d_%H%M%S).log"
+  : > "$LOG_FILE"
+  chmod 600 -- "$LOG_FILE"
+}
+
+# Under a --json command stdout carries the payload and nothing else. A
+# progress line printed there corrupts it, and the widget cannot tell a
+# polluted document from a crashed script -- which is exactly what happened
+# with a destination that has a pre_command. Human-readable output therefore
+# goes to stderr whenever the caller asked for JSON.
+log_line() {
+  if [ "$JSON_MODE" = "1" ]; then
+    printf '%s\n' "$*" >&2
+  else
+    printf '%s\n' "$*"
+  fi
+  [ -n "$LOG_FILE" ] && printf '%s\n' "$*" >> "$LOG_FILE"
+  return 0
+}
+
+prune_old_logs() {
+  local dir="$LOG_ROOT/$DEST_NAME"
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -name '*.log' -type f -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Validating what arrives from the widget
+#
+# The widget passes snapshot ids and paths back in. Those come from the
+# repository, so they are treated as input: check the shape and refuse rather
+# than repair, and always put a `--` between them and restic. These do not
+# print anything, so they can call die() and actually stop the run.
+# ---------------------------------------------------------------------------
+
+validate_snapshot_id() {
+  [ "$1" = "latest" ] && return 0
+  [[ "$1" =~ ^[0-9a-f]{8,64}$ ]] || die "invalid snapshot id \"$1\""
+  return 0
+}
+
+validate_absolute_path() {
+  case "$1" in
+    /*) return 0 ;;
+    *) die "path must be absolute: \"$1\"" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+key_warning() {
+  cat <<'TEXT'
+── Keep a copy of this key somewhere else ──────────────────────────
+The key file lives in your home directory, and your home directory
+is exactly what gets backed up. The copy inside the repository is
+encrypted with itself and therefore worthless: lose this machine and
+the backup cannot be opened without this key. Put it in a password
+manager, on paper, or on another host.
+────────────────────────────────────────────────────────────────────
+TEXT
+}
+
+cmd_key() {
+  local action="${1:-}"
+  [ "$#" -gt 0 ] && shift
+  parse_options "$@"
+
+  local password path
+  load_config
+  select_destination "$OPT_DEST"
+  config_dir_secure
+
+  path="$(expand_tilde "$(dest '.password_file // empty')")"
+  [ -n "$path" ] || path="$CONFIG_DIR/$DEST_NAME.key"
+
+  case "$action" in
+    set)
+      [ -z "$(dest '.password_command // empty')" ] ||
+        die "destination $DEST_NAME uses password_command; a key file would do nothing there"
+
+      printf 'Repository password for %s (input is hidden):\n' "$DEST_NAME" >&2
+      if [ -t 0 ]; then
+        read -rs password
+        printf '\n' >&2
+      else
+        IFS= read -r password
+      fi
+      [ -n "$(trim "$password")" ] || die "empty password"
+
+      printf '%s\n' "$password" | write_private "$path" || die "could not write $path"
+
+      # Record where it went. Deriving <name>.key from the destination name is
+      # fine as a bootstrap default, but leaving it at that means config.json
+      # never says where the password lives -- you have to know the rule. After
+      # this the file states it, and nothing is implicit any more.
+      if [ -z "$(dest '.password_file // empty')" ]; then
+        jq --arg n "$DEST_NAME" --arg p "$path" \
+          '(.destinations[] | select(.name == $n) | .password_file) = $p' <<<"$CONFIG_JSON" \
+          | write_private "$CONFIG_FILE" || die "could not record password_file in $CONFIG_FILE"
+        printf 'Key written to %s (mode 600), and recorded in config.json.\n\n' "$path"
+      else
+        printf 'Key written to %s (mode 600).\n\n' "$path"
+      fi
+      key_warning
+      ;;
+    show)
+      user_file "$path" || die "no key file at $path"
+      key_warning
+      printf '\n'
+      cat -- "$path"
+      ;;
+    *)
+      die "usage: key set|show --dest <name>"
+      ;;
+  esac
+}
+
+cmd_destinations() {
+  JSON_MODE=1
+  demo_on && { demo_destinations_json; return 0; }
+  load_config
+  local out active name url display
+  out='[]'
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    select_destination "$name"
+    load_secrets
+    url="$(dest '.repository // empty')"
+    # Non-strict: a destination whose .env is missing must still be listed,
+    # otherwise the widget cannot show the user which one needs fixing.
+    substitute_vars "$url" 0
+    display="$(sanitize_repository "$SUBST_RESULT")"
+    out="$(jq -c \
+      --arg name "$name" \
+      --arg label "$(dest_label)" \
+      --arg display "$display" \
+      --arg schedule "$(dest '.schedule // empty')" \
+      '. + [{name:$name, display_name:$label, repository_display:$display,
+             schedule:(if $schedule == "" then null else $schedule end)}]' <<<"$out")"
+  done < <(cfg '.destinations[].name')
+
+  jq -nc --argjson d "$out" '{ok:true, destinations:$d}'
+}
+
+
+# The only call the widget makes on a timer. Deliberately touches no network
+# and no key file: configuration, status.json and the progress file, no more.
+cmd_status() {
+  JSON_MODE=1
+  demo_on && { demo_status_json; return 0; }
+  if ! user_file "$CONFIG_FILE"; then
+    jq -nc --arg e "no configuration at $CONFIG_FILE" \
+      '{ok:true, configured:false, invalid:false, error:$e, destinations:[]}'
+    return 0
+  fi
+
+  # A broken configuration is not the same problem as a missing one. They used
+  # to look identical from the panel, which offered to create a file that was
+  # already there while saying nothing about what was wrong with it.
+  local problem
+  if ! problem="$(config_problem "$(cat -- "$CONFIG_FILE")")"; then
+    jq -nc --arg e "$problem" \
+      '{ok:true, configured:false, invalid:true, error:$e, destinations:[]}'
+    return 0
+  fi
+  load_config
+
+  local status active out name progress running epoch age updated installed repo
+  status="$(load_status)"
+  epoch="$(date +%s)"
+  out='[]'
+
+  # "Back Up Now" starts a systemd unit. Without `install` that unit does not
+  # exist, systemctl fails, and the button does nothing at all -- which reads
+  # as a broken plugin rather than a missing step. Report it so the panel can
+  # say what to do instead of offering a control that cannot work.
+  installed=false
+  readable_file "$SYSTEMD_DIR/omarchy-time-machine@.service" && installed=true
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    progress="$(read_json_or "$STATE_DIR/progress-$name.json" 'null')"
+    running=false
+
+    # A progress file older than ten seconds means the writer died without
+    # closing it; treating that as "running" would freeze the widget on a
+    # percentage that never moves again.
+    if [ "$(jq -r 'if type == "object" then (.state // "") else "" end' <<<"$progress" 2>/dev/null)" = "running" ]; then
+      updated="$(jq -r '.updated_epoch // empty' <<<"$progress" 2>/dev/null)"
+      updated="$(number_or "$updated" 0)"
+      age=$((epoch - updated))
+      [ "$updated" -gt 0 ] && [ "$age" -lt "$STALE_PROGRESS_SECONDS" ] && running=true
+    fi
+
+    if systemctl --user --quiet is-active "omarchy-time-machine@$name.service" 2>/dev/null; then
+      running=true
+    fi
+
+    repo="$(sanitize_repository "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .repository // ""' <<<"$CONFIG_JSON")")"
+
+    out="$(jq -c \
+      --arg name "$name" \
+      --arg label "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .display_name // $n' <<<"$CONFIG_JSON")" \
+      --arg repo "$repo" \
+      --argjson stored "$(jq -c --arg n "$name" '.destinations[$n] // {}' <<<"$status")" \
+      --arg schedule "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .schedule // ""' <<<"$CONFIG_JSON")" \
+      --argjson running "$running" \
+      --argjson progress "$progress" \
+      '. + [$stored + {name:$name, display_name:$label,
+                       schedule:(if $schedule == "" then null else $schedule end),
+                       running:$running,
+                       repository_display:(if $repo == "" then ($stored.repository_display // "") else $repo end),
+                       progress:(if $running then $progress else null end)}]' <<<"$out")"
+  done < <(cfg '.destinations[].name')
+
+  jq -nc --argjson d "$out" --argjson installed "$installed" \
+    '{ok:true, configured:true, invalid:false, units_installed:$installed, destinations:$d}'
+}
+
+cmd_init() {
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  config_dir_secure
+  private_dir "$STATE_DIR" logs
+  restic_context
+  run_pre_command
+
+  printf 'Creating repository at %s...\n' "$REPO_DISPLAY" >&2
+  restic_run init || return 1
+  printf '\n'
+  key_warning
+}
+
+cmd_check() {
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  restic_context
+  run_pre_command
+  restic_run check
+}
+
+cmd_snapshots() {
+  JSON_MODE=1
+  demo_on && { demo_snapshots_json; return 0; }
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  restic_context
+  run_pre_command
+
+  local out
+  out="$(restic_run snapshots --json 2>/dev/null)"
+  [ -n "$out" ] || { jq -nc '{ok:false, error:"could not read snapshots", snapshots:[]}'; return 0; }
+
+  jq -c '{ok:true, snapshots:([.[] | {id, short_id, time, paths, summary}] | reverse)}' <<<"$out" 2>/dev/null ||
+    jq -nc '{ok:false, error:"unexpected snapshot output", snapshots:[]}'
+}
+
+# Without --recursive, restic ls returns only the direct children of the given
+# path. The whole restore browser hangs on that: a tree of a million files is
+# never loaded in one go.
+cmd_ls() {
+  JSON_MODE=1
+  parse_options "$@"
+  local path="$OPT_PATH"
+  [ -n "$path" ] || path="/"
+  demo_on && { demo_ls_json "$path"; return 0; }
+  validate_snapshot_id "$OPT_SNAPSHOT"
+  validate_absolute_path "$path"
+
+  load_config
+  select_destination "$OPT_DEST"
+  restic_context
+  run_pre_command
+
+  local out
+  out="$(restic_run ls --json -- "$OPT_SNAPSHOT" "$path" 2>/dev/null)"
+  [ -n "$out" ] ||
+    { jq -nc --arg p "$path" '{ok:false, error:"could not list snapshot", path:$p, entries:[]}'; return 0; }
+
+  jq -sc --arg path "$path" --argjson cap "$LS_ENTRY_CAP" '
+    [ .[] | select(has("name") and (.path // "") != $path)
+          | {name, type, path, size, mtime} ]
+    | sort_by([(if .type == "dir" then 0 else 1 end), (.name | ascii_downcase)])
+    | {ok:true, path:$path, truncated:(length > $cap), entries:(.[0:$cap])}' <<<"$out" 2>/dev/null ||
+    jq -nc --arg p "$path" '{ok:false, error:"unexpected ls output", path:$p, entries:[]}'
+}
+
+cmd_log() {
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  local latest
+  latest="$(find "$LOG_ROOT/$DEST_NAME" -maxdepth 1 -name '*.log' -type f 2>/dev/null | sort | tail -1)"
+  [ -n "$latest" ] || { printf 'no log files yet for %s\n' "$DEST_NAME" >&2; return 1; }
+  printf '%s\n' "$latest"
+}
+
+# ---------------------------------------------------------------------------
+# backup
+# ---------------------------------------------------------------------------
+
+cmd_backup() {
+  demo_on && { printf 'Demo mode is on; refusing to run a real backup.\n' >&2; return 0; }
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  config_dir_secure
+  private_dir "$STATE_DIR" logs
+  open_log
+  progress_init backup "omarchy-time-machine@$DEST_NAME.service"
+
+  local started started_epoch backup_args exclude_file source pattern
+  started="$(date -Iseconds)"
+  started_epoch="$(date +%s)"
+
+  # A run that dies before its cleanup -- a config error, a kill -- leaves its
+  # scratch file behind. Sweep them here rather than only on the happy path,
+  # so they cannot accumulate across months of nightly runs.
+  find "$STATE_DIR" -maxdepth 1 -name '.summary.*' -type f -mmin +60 -delete 2>/dev/null
+
+  # Global, not local: the EXIT trap runs after this function's scope is gone,
+  # where a local would be unset -- and under `set -u` that is a hard error on
+  # every single run.
+  SUMMARY_FILE="$(mktemp -- "$STATE_DIR/.summary.XXXXXX")" || die "could not create a temporary file"
+  ERROR_FILE="$SUMMARY_FILE.reason"
+  chmod 600 -- "$SUMMARY_FILE"
+  trap 'rm -f -- "${SUMMARY_FILE:-}" "${ERROR_FILE:-}"' EXIT
+
+  restic_context
+
+  source="$(expand_tilde "$(cfg '.source // empty')")"
+  [ -n "$source" ] || source="$HOME"
+
+  log_line "=== Time Machine — backup to $DEST_NAME ==="
+  log_line "Started: $(date)"
+  log_line "Source:  $source"
+  log_line "Target:  $REPO_DISPLAY"
+  log_line "Log:     $LOG_FILE"
+  [ "$OPT_DRY_RUN" = "1" ] && log_line "DRY RUN: nothing will be written"
+  log_line ""
+
+  progress_write running pre 1
+  run_pre_command
+
+  progress_write running unlock 1
+  clear_stale_locks
+
+  backup_args=(backup --json --exclude-caches --retry-lock 10m)
+
+  # An explicitly configured exclude file that is missing is an error: you
+  # asked for it, and silently backing up everything you meant to skip is worse
+  # than stopping. The default one is optional -- if it is not there, there is
+  # simply nothing to exclude.
+  exclude_file="$(expand_tilde "$(cfg '.exclude_file // empty')")"
+  if [ -n "$exclude_file" ]; then
+    user_file "$exclude_file" || die "exclude_file is missing: $exclude_file"
+  elif user_file "$CONFIG_DIR/excludes.txt"; then
+    exclude_file="$CONFIG_DIR/excludes.txt"
+  fi
+  [ -n "$exclude_file" ] && backup_args+=(--exclude-file "$exclude_file")
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] && backup_args+=(--exclude "$pattern")
+  done < <(cfg '.excludes[]? // empty' 2>/dev/null)
+  [ "$(cfg '.one_file_system // true')" = "true" ] && backup_args+=(--one-file-system)
+  [ "$(cfg '.skip_if_unchanged // true')" = "true" ] && backup_args+=(--skip-if-unchanged)
+  [ "$OPT_DRY_RUN" = "1" ] && backup_args+=(--dry-run)
+  backup_args+=(-- "$source")
+
+  progress_write running backup 1
+
+  local backup_exit summary result
+  restic_run "${backup_args[@]}" 2>>"$LOG_FILE" | stream_backup "$SUMMARY_FILE" "$ERROR_FILE"
+  backup_exit="${PIPESTATUS[0]}"
+  backup_exit="$(number_or "$backup_exit" 1)"
+
+  summary='null'
+  if readable_file "$SUMMARY_FILE" && [ -s "$SUMMARY_FILE" ]; then
+    summary="$(cat -- "$SUMMARY_FILE")"
+  fi
+  rm -f -- "$SUMMARY_FILE"
+
+  if [ "$summary" != "null" ]; then
+    log_line "$(jq -r '"Files: \(.files_new // 0) new, \(.files_changed // 0) changed, \(.files_unmodified // 0) unmodified"' <<<"$summary" 2>/dev/null)"
+    log_line "$(jq -r '"Added:    \(((.data_added // 0) / 1048576) | floor) MiB"' <<<"$summary" 2>/dev/null)"
+    log_line "$(jq -r '"Snapshot: \(.snapshot_id // "(none — nothing changed)")"' <<<"$summary" 2>/dev/null)"
+  fi
+
+  case "$backup_exit" in
+    0) log_line "Backup finished successfully"; result=ok ;;
+    3) log_line "Backup finished, some files could not be read"; result=warnings ;;
+    *) log_line "Backup failed (exit code $backup_exit)"; result=failed ;;
+  esac
+
+  if [ "$result" != "failed" ] && [ "$OPT_DRY_RUN" != "1" ]; then
+    progress_write running prune 1
+    run_forget
+    prune_old_logs
+  fi
+
+  [ "$OPT_DRY_RUN" = "1" ] || record_status "$started" "$started_epoch" "$backup_exit" "$result" "$summary"
+
+  progress_write "$([ "$result" = "failed" ] && echo failed || echo done)" backup 1 \
+    "$(jq -nc --arg r "$result" '{percent:1.0, result:$r}')"
+
+  log_line ""
+  log_line "Finished: $(date)"
+
+  return "$backup_exit"
+}
+
+# Reads restic's --json stream: turns status lines into the progress file,
+# stashes the summary for the caller, and passes anything unrecognised to the
+# log. Runs in a subshell because it sits in a pipeline, hence the summary file
+# rather than a variable.
+stream_backup() {
+  local summary_file="$1"
+  local error_file="$2"
+  local line type extra message
+  while IFS= read -r line; do
+    type="$(jq -r 'if type == "object" then (.message_type // "") else "" end' <<<"$line" 2>/dev/null)"
+    case "$type" in
+      status)
+        extra="$(jq -c '{
+          percent: (.percent_done // 0),
+          files_done: (.files_done // 0),
+          total_files: (.total_files // 0),
+          bytes_done: (.bytes_done // 0),
+          total_bytes: (.total_bytes // 0),
+          current_file: ((.current_files // []) | first)
+        }' <<<"$line" 2>/dev/null)"
+        [ -n "$extra" ] || extra='{}'
+        progress_write running backup 0 "$extra"
+        ;;
+      summary)
+        printf '%s' "$line" > "$summary_file"
+        ;;
+      error)
+        log_line "restic: $(jq -r '.error.message // "unknown error"' <<<"$line" 2>/dev/null)"
+        ;;
+      exit_error)
+        # With --json, restic reports a fatal error as a line on stdout rather
+        # than as text on stderr. Without this case it would land in the log as
+        # raw JSON, and the panel would have nothing to say beyond an exit
+        # code.
+        message="$(jq -r '.message // ""' <<<"$line" 2>/dev/null)"
+        [ -n "$message" ] || message="restic exited with an error"
+        log_line "$message"
+        # Only the first line: the rest is restic suggesting where to look,
+        # which is useful in a log and too long for a notification.
+        printf '%s' "$(printf '%s' "$message" | head -1)" > "$error_file"
+        ;;
+      *)
+        [ -n "$(trim "$line")" ] && log_line "$line"
+        ;;
+    esac
+  done
+  return 0
+}
+
+run_forget() {
+  log_line ""
+  log_line "Removing old snapshots..."
+  restic_run forget \
+    --keep-daily "$(keep_value daily 7)" \
+    --keep-weekly "$(keep_value weekly 4)" \
+    --keep-monthly "$(keep_value monthly 12)" \
+    --keep-yearly "$(keep_value yearly 3)" \
+    --retry-lock 10m \
+    --prune >>"$LOG_FILE" 2>&1 ||
+    log_line "forget/prune reported a problem, see the log"
+  return 0
+}
+
+# The line worth showing a human out of a failed run. restic says the useful
+# thing on a line starting with "Fatal:", and this script's own errors start
+# with "Error:". Everything else in the log is progress noise, so fall back to
+# the last non-empty line only when neither is there.
+last_error_line() {
+  local logfile="$1" line=""
+  readable_file "$logfile" || return 0
+
+  # restic --json reports a fatal error as JSON on *stderr*, which lands in the
+  # log verbatim rather than travelling through the stdout pipe. So the message
+  # has to be dug out of the log rather than caught while streaming.
+  line="$(grep -F '"message_type":"exit_error"' -- "$logfile" 2>/dev/null | tail -1)"
+  if [ -n "$line" ]; then
+    line="$(jq -r '.message // ""' <<<"$line" 2>/dev/null | head -1)"
+  fi
+
+  # Otherwise: restic's plain-text errors start with "Fatal:", this script's own
+  # start with "Error:". Everything else in the log is progress noise, so only
+  # fall back to the last line when neither is there.
+  [ -n "$line" ] || line="$(grep -E '^(Fatal|Error|error):' -- "$logfile" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || line="$(grep -v '^[[:space:]]*$' -- "$logfile" 2>/dev/null | tail -1)"
+
+  # Drop restic's "Fatal:" shout. The notification it goes under already says
+  # the backup failed; saying it twice just costs room for the actual reason.
+  line="${line#Fatal: }"
+  line="${line#Error: }"
+  line="${line#error: }"
+
+  # Long enough to say what broke, short enough to stay a notification.
+  printf '%s' "${line:0:180}"
+}
+
+record_status() {
+  local started="$1" started_epoch="$2" exit_code="$3" result="$4" summary="$5"
+  local status snapshot_count repo_size finished finished_epoch duration
+
+  finished="$(date -Iseconds)"
+  finished_epoch="$(date +%s)"
+  duration=$((finished_epoch - started_epoch))
+  status="$(load_status)"
+
+  local reason=""
+  if [ "$result" = "failed" ]; then
+    if readable_file "$ERROR_FILE" && [ -s "$ERROR_FILE" ]; then
+      reason="$(head -1 -- "$ERROR_FILE")"
+    else
+      reason="$(last_error_line "$LOG_FILE")"
+    fi
+  fi
+
+  # Snapshot count and repository size only after a successful run: the
+  # connection is open anyway at that point. After a failure the old values
+  # stay, because they were true when written and an empty field would read as
+  # "0 snapshots".
+  snapshot_count=null
+  repo_size=null
+  if [ "$result" != "failed" ]; then
+    snapshot_count="$(number_or "$(restic_run snapshots --json 2>/dev/null | jq -r 'length' 2>/dev/null)" null)"
+    repo_size="$(number_or "$(restic_run stats --mode raw-data --json 2>/dev/null | jq -r '.total_size // empty' 2>/dev/null)" null)"
+  fi
+
+  jq \
+    --arg name "$DEST_NAME" \
+    --arg display "$REPO_DISPLAY" \
+    --arg started "$started" \
+    --arg finished "$finished" \
+    --arg result "$result" \
+    --arg logfile "$LOG_FILE" \
+    --arg reason "$reason" \
+    --argjson duration "$duration" \
+    --argjson exit_code "$(number_or "$exit_code" 1)" \
+    --argjson summary "$summary" \
+    --argjson count "$snapshot_count" \
+    --argjson size "$repo_size" \
+    '
+    .version = 1
+    | .destinations[$name] = ((.destinations[$name] // {}) + {
+        repository_display: $display,
+        last_run: {
+          started_at: $started,
+          finished_at: $finished,
+          duration_seconds: $duration,
+          exit_code: $exit_code,
+          result: $result,
+          snapshot_id: ($summary.snapshot_id // null),
+          files_new: ($summary.files_new // null),
+          files_changed: ($summary.files_changed // null),
+          data_added_bytes: ($summary.data_added // null),
+          total_files: ($summary.total_files_processed // null),
+          error: (if $reason == "" then null else $reason end),
+          log_file: $logfile
+        }
+      })
+    | if $result != "failed" then .destinations[$name].last_success_at = $finished else . end
+    | if $count != null then .destinations[$name].snapshot_count = $count else . end
+    | if $size != null then .destinations[$name].repo_size_bytes = $size else . end
+    ' <<<"$status" | write_private "$STATUS_FILE" ||
+    printf 'could not update status.json\n' >&2
+  return 0
+}
+
+# A finished backup says nothing. It succeeds every night, and a notification
+# that always arrives is one you stop reading -- which is exactly when the one
+# that matters gets dismissed with the rest. The bar icon carries the state,
+# and the panel carries the detail.
+#
+# Failures do notify, through the OnFailure unit (`report-failure`). That path
+# is separate on purpose: if this process is killed -- OOM, TimeoutStartSec --
+# it never reaches its own last line, but systemd still notices.
+
+# Per destination, with the global one as fallback. The values travel through
+# the environment rather than as arguments: a destination name comes out of
+# config.json and is therefore input.
+run_failure_command() {
+  local exit_code="$1" logfile="$2" cmd
+  cmd="$(dest '.on_failure_command // empty')"
+  [ -n "$cmd" ] || cmd="$(cfg '.on_failure_command // empty')"
+  [ -n "$cmd" ] || return 0
+
+  DESTINATION="$DEST_NAME" EXIT_CODE="$exit_code" LOG_FILE="$logfile" \
+    setsid bash -c "$cmd" >/dev/null 2>&1 &
+  return 0
+}
+
+# Runs as the OnFailure unit, so it also fires when the backup process itself
+# died without ever being able to write anything. Takes what it can from
+# status.json and falls back to a bare notification when there is nothing
+# useful there.
+cmd_report_failure() {
+  parse_options "$@"
+  local name="$OPT_DEST"
+  local status run exit_code logfile detail label
+  [ -n "$name" ] || name="backup"
+
+  status="$(load_status)"
+  run="$(jq -c --arg n "$name" '.destinations[$n].last_run // {}' <<<"$status" 2>/dev/null)"
+  [ -n "$run" ] || run='{}'
+  exit_code="$(jq -r '.exit_code // 1' <<<"$run" 2>/dev/null)"
+  logfile="$(jq -r '.log_file // ""' <<<"$run" 2>/dev/null)"
+
+  # What went wrong, not where the log lives. A path is something you act on
+  # after you know the reason, and it does not fit on a notification anyway.
+  detail="$(jq -r '.error // ""' <<<"$run" 2>/dev/null)"
+  [ -n "$detail" ] || detail="$(last_error_line "$logfile")"
+  [ -n "$detail" ] || detail="Click to open the log."
+
+  # The readable label needs the config, which may itself be why the run
+  # failed. Fall back to the identifier rather than saying nothing.
+  label="$name"
+  if user_file "$CONFIG_FILE"; then
+    load_config
+    if select_destination "$name" 2>/dev/null; then label="$(dest_label)"; fi
+  fi
+
+  # -t 0 is "never expire" in the freedesktop spec, and this daemon lists
+  # "persistence" among its capabilities. A failed backup is the one message
+  # that must not scroll past while you are looking elsewhere, so it stays
+  # until it is dismissed by hand.
+  #
+  # Clicking it opens the log, so it is not a dead end that hands you a path to
+  # go and find. -A implies --wait, hence the detached subshell; the timeout is
+  # a backstop so a notification nobody ever touches cannot leave a process
+  # sitting around for weeks.
+  if [ -z "${OMARCHY_TIME_MACHINE_QUIET:-}" ]; then
+    (
+      action="$(timeout 86400 notify-send -u critical -t 0 \
+        -i "$(icon_for icon)" \
+        -A "default=Open log" \
+        -- "Backup failed: $label" "$detail" 2>/dev/null)"
+      if [ "$action" = "default" ] && [ -n "$logfile" ]; then
+        setsid omarchy-launch-editor "$logfile" >/dev/null 2>&1 &
+      fi
+    ) >/dev/null 2>&1 &
+  fi
+
+  [ -n "$DEST_JSON" ] && run_failure_command "$exit_code" "$logfile"
+  return 0
+}
+
+# Opens a file manager with the given path selected in its parent folder --
+# the thing you actually want after a restore, rather than being told a path
+# and having to go find it yourself.
+open_in_file_manager() {
+  local path="$1"
+  if command -v nautilus >/dev/null 2>&1; then
+    setsid nautilus --select -- "$path" >/dev/null 2>&1 &
+  elif command -v thunar >/dev/null 2>&1; then
+    setsid thunar -- "$(dirname -- "$path")" >/dev/null 2>&1 &
+  elif command -v dolphin >/dev/null 2>&1; then
+    setsid dolphin --select -- "$path" >/dev/null 2>&1 &
+  else
+    setsid xdg-open "$(dirname -- "$path")" >/dev/null 2>&1 &
+  fi
+  return 0
+}
+
+# A restore notification you can click. `notify-send -A` implies --wait, so it
+# blocks until the notification is dismissed or activated; the whole thing is
+# therefore detached, and capped with a timeout so a notification nobody ever
+# touches cannot leave a process sitting around for days.
+#
+# The action key "default" is what the freedesktop spec reserves for a click on
+# the notification body itself, which this shell's daemon supports (it lists
+# "actions" among its capabilities).
+notify_restore_done() {
+  local target="$1" selected="$2"
+  [ -n "${OMARCHY_TIME_MACHINE_QUIET:-}" ] && return 0
+  (
+    action="$(timeout 3600 notify-send -i "$(icon_for icon)" \
+      -A "default=Show in Files" \
+      -- "Restore complete" "Restored into $target" 2>/dev/null)"
+    [ "$action" = "default" ] && open_in_file_manager "$selected"
+  ) >/dev/null 2>&1 &
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# restore
+# ---------------------------------------------------------------------------
+
+cmd_restore() {
+  JSON_MODE=1
+  demo_on && { jq -nc '{ok:true, target:"~/Restored/2026-08-24-1900"}'; return 0; }
+  parse_options "$@"
+  validate_snapshot_id "$OPT_SNAPSHOT"
+  validate_absolute_path "$OPT_PATH"
+
+  load_config
+  select_destination "$OPT_DEST"
+  restic_context
+
+  # Never in place. A restore must not be able to erase work created after the
+  # snapshot, so everything lands in a dated directory the user then moves.
+  local target restore_exit
+  target="$(expand_tilde "$OPT_TARGET")"
+  [ -n "$target" ] || target="$HOME/Restored/$(date +%Y-%m-%d-%H%M)"
+  mkdir -p -- "$target" || die "could not create $target"
+
+  private_dir "$STATE_DIR" logs
+  progress_init restore
+  progress_write running pre 1
+  run_pre_command
+  progress_write running restore 1
+
+  restic_run restore --json --include "$OPT_PATH" --target "$target" -- "$OPT_SNAPSHOT" 2>/dev/null |
+    stream_restore
+  restore_exit="$(number_or "${PIPESTATUS[0]}" 1)"
+
+  progress_write "$([ "$restore_exit" = "0" ] && echo done || echo failed)" restore 1 \
+    "$(jq -nc --arg t "$target" '{percent:1.0, target:$t}')"
+
+  if [ "$restore_exit" = "0" ]; then
+    # restic reproduces the full original path under the target, so this is
+    # where the restored item actually landed.
+    notify_restore_done "$target" "$target$OPT_PATH"
+    jq -nc --arg t "$target" --arg s "$target$OPT_PATH" '{ok:true, target:$t, restored:$s}'
+  else
+    jq -nc --arg e "restic restore exited $restore_exit" '{ok:false, error:$e}'
+  fi
+  return "$restore_exit"
+}
+
+stream_restore() {
+  local line extra
+  while IFS= read -r line; do
+    [ "$(jq -r 'if type == "object" then (.message_type // "") else "" end' <<<"$line" 2>/dev/null)" = "status" ] || continue
+    extra="$(jq -c '{
+      percent: (.percent_done // 0),
+      files_done: (.files_restored // .files_done // 0),
+      total_files: (.total_files // 0),
+      bytes_done: (.bytes_restored // .bytes_done // 0),
+      total_bytes: (.total_bytes // 0)
+    }' <<<"$line" 2>/dev/null)"
+    [ -n "$extra" ] || extra='{}'
+    progress_write running restore 0 "$extra"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Starter configuration
+#
+# Opening an editor on a file that does not exist leaves you staring at an
+# empty buffer, which is a rotten way to meet a program. This writes something
+# that already works once you change one path. JSON has no comments, so the
+# values have to do the teaching: CHANGE-ME cannot be mistaken for a real path,
+# and cannot accidentally point at one either.
+# ---------------------------------------------------------------------------
+
+cmd_config() {
+  case "${1:-}" in
+    create) ;;
+    "") die "usage: config create" ;;
+    *) die "unknown config command: $1" ;;
+  esac
+
+  if user_file "$CONFIG_FILE"; then
+    printf 'There is already a configuration at %s\n' "$CONFIG_FILE" >&2
+    printf '%s\n' "$CONFIG_FILE"
+    return 0
+  fi
+
+  config_dir_secure
+  cat <<'JSON' | write_private "$CONFIG_FILE" || die "could not write $CONFIG_FILE"
+{
+  "source": "~",
+  "retention": { "daily": 7, "weekly": 4, "monthly": 12, "yearly": 3 },
+  "destinations": [
+    {
+      "name": "backup-drive",
+      "display_name": "Backup drive",
+      "repository": "/run/media/CHANGE-ME/backup/restic",
+      "schedule": "*-*-* 03:00:00"
+    }
+  ]
+}
+JSON
+
+  printf 'Wrote a starter configuration to %s\n' "$CONFIG_FILE" >&2
+  printf 'Point "repository" at your drive, then run:\n' >&2
+  printf '  omarchy-time-machine key set --dest backup-drive\n' >&2
+  printf '  omarchy-time-machine init --dest backup-drive\n' >&2
+  printf '  omarchy-time-machine install\n' >&2
+  printf '%s\n' "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# systemd
+# ---------------------------------------------------------------------------
+
+# systemd user services do not inherit the shell PATH. restic, jq, ssh and
+# notify-send live in /usr/bin; a user's pre_command often lives in
+# ~/.local/bin.
+unit_path_env() { printf '%s' "$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; }
+
+service_unit() {
+  cat <<UNIT
+[Unit]
+Description=Time Machine backup to %i
+Documentation=https://github.com/jankeesvw/omarchy-time-machine
+After=network-online.target
+Wants=network-online.target
+OnFailure=omarchy-time-machine-failed@%i.service
+
+[Service]
+Type=oneshot
+Environment=PATH=$(unit_path_env)
+ExecStart=$SELF backup --dest %i
+
+# restic exits 3 when files were unreadable or vanished during the run. On a
+# live system that is normal, not a failure -- without this line systemd would
+# fire the OnFailure unit almost every night.
+SuccessExitStatus=3
+
+# The first run takes hours, later ones minutes. Leave room, so a slow night is
+# not cut off halfway.
+TimeoutStartSec=8h
+
+# A backup must not make the machine unusable while you work on it.
+Nice=10
+IOSchedulingClass=idle
+UNIT
+}
+
+failed_unit() {
+  cat <<UNIT
+[Unit]
+Description=Report a failed Time Machine backup of %i
+
+[Service]
+Type=oneshot
+Environment=PATH=$(unit_path_env)
+ExecStart=$SELF report-failure --dest %i
+UNIT
+}
+
+timer_unit() {
+  local name="$1" schedule="$2" delay="$3"
+  cat <<UNIT
+[Unit]
+Description=Time Machine backup to $name
+Requires=omarchy-time-machine@$name.service
+
+[Timer]
+Unit=omarchy-time-machine@$name.service
+OnCalendar=$schedule
+# If the machine was off at that moment, run as soon as it comes back.
+Persistent=true
+RandomizedDelaySec=$delay
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+write_unit() {
+  # Separate statements on purpose: bash expands every argument of `local`
+  # before performing any of the assignments, so a `path="$DIR/$filename"` on
+  # the same line would read $filename while it is still unset -- and under
+  # `set -u` that aborts the run.
+  local filename="$1"
+  local content="$2"
+  local path="$SYSTEMD_DIR/$filename"
+  local existing=""
+  local marker
+  readable_file "$path" && existing="$(cat -- "$path")"
+  if [ "$existing" = "$content" ]; then
+    printf '  = %s (unchanged)\n' "$filename"
+    return 0
+  fi
+  printf '%s\n' "$content" > "$path.tmp.$$" && mv -f -- "$path.tmp.$$" "$path" ||
+    die "could not write $path"
+  if [ -n "$existing" ]; then marker='~'; else marker='+'; fi
+  printf '  %s %s\n' "$marker" "$filename"
+}
+
+cmd_install() {
+  load_config
+  mkdir -p -- "$SYSTEMD_DIR"
+
+  printf 'Writing units into %s:\n' "$SYSTEMD_DIR"
+  write_unit "omarchy-time-machine@.service" "$(service_unit)"
+  write_unit "omarchy-time-machine-failed@.service" "$(failed_unit)"
+
+  local names=() name schedule delay unit path filename keep
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    schedule="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .schedule // ""' <<<"$CONFIG_JSON")"
+    [ -n "$schedule" ] || continue
+    delay="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .randomized_delay // "15m"' <<<"$CONFIG_JSON")"
+    names+=("$name")
+    write_unit "omarchy-time-machine@$name.timer" "$(timer_unit "$name" "$schedule" "$delay")"
+  done < <(cfg '.destinations[].name')
+
+  # Timers for destinations that no longer exist, or that lost their schedule:
+  # remove them, otherwise a backup keeps running for a destination nobody has
+  # configured any more.
+  shopt -s nullglob
+  for path in "$SYSTEMD_DIR"/omarchy-time-machine@*.timer; do
+    filename="$(basename -- "$path")"
+    keep=0
+    for name in ${names+"${names[@]}"}; do
+      [ "$filename" = "omarchy-time-machine@$name.timer" ] && keep=1
+    done
+    [ "$keep" = "1" ] && continue
+    systemctl --user disable --now "$filename" >/dev/null 2>&1
+    rm -f -- "$path"
+    printf '  - %s (no longer configured)\n' "$filename"
+  done
+  shopt -u nullglob
+
+  systemctl --user daemon-reload
+
+  if [ "${#names[@]}" -eq 0 ]; then
+    printf '\nNo destination has a schedule, so nothing runs automatically.\n'
+    printf 'Set an OnCalendar value in config.json (for example "*-*-* 03:00:00") and run this again.\n'
+    return 0
+  fi
+
+  local failures=0
+  for name in "${names[@]}"; do
+    unit="omarchy-time-machine@$name.timer"
+    if systemctl --user enable --now "$unit" >/dev/null 2>&1; then
+      printf '  enabled %s\n' "$unit"
+    else
+      printf '  could not enable %s\n' "$unit" >&2
+      failures=$((failures + 1))
+    fi
+  done
+
+  printf '\nNext run:\n'
+  systemctl --user list-timers 'omarchy-time-machine@*.timer' --no-pager
+
+  # Writing the units but failing to enable them means nothing is scheduled.
+  # Reporting success there would be a lie the user only discovers by noticing
+  # that no backup ever ran.
+  [ "$failures" = "0" ]
+}
+
+# ---------------------------------------------------------------------------
+# Demo mode
+#
+# Screenshots must never show a real home directory, a real NAS address or a
+# real snapshot history. `demo on` swaps every read for invented-but-plausible
+# data and turns every write into a no-op, so a click while posing cannot
+# touch the actual repository. Timestamps are generated relative to now, so
+# the same screenshot still reads correctly a year from now.
+# ---------------------------------------------------------------------------
+
+DEMO_FILE="$STATE_DIR/demo"
+
+demo_on() { readable_file "$DEMO_FILE"; }
+
+# Which situation the demo is pretending to be in. A screenshot of the happy
+# path is the easy one; the states worth showing a prospective user are the
+# ones they will meet on a bad day.
+demo_scene() {
+  local scene=""
+  readable_file "$DEMO_FILE" && scene="$(head -1 -- "$DEMO_FILE" 2>/dev/null)"
+  case "$scene" in
+    running|failed) printf '%s' "$scene" ;;
+    *) printf '%s' "idle" ;;
+  esac
+}
+
+demo_destinations_json() {
+  jq -nc '{ok:true, destinations:[
+    {name:"nas", display_name:"Synology NAS", repository_display:"rest:http://10.0.0.4:8000/",        schedule:"*-*-* 03:00:00", active:true},
+    {name:"usb", display_name:"Drive in my bag", repository_display:"/run/media/backup/restic",          schedule:null,             active:false},
+    {name:"offsite", display_name:"Offsite", repository_display:"s3:s3.eu-central-1.amazonaws.com/attic", schedule:"*-*-* 04:30:00", active:false}
+  ]}'
+}
+
+demo_status_json() {
+  case "$(demo_scene)" in
+    running) demo_status_running; return 0 ;;
+    failed)  demo_status_failed;  return 0 ;;
+  esac
+
+  jq -nc --argjson now "$(date +%s)" '
+    def iso($t): $t | strftime("%Y-%m-%dT%H:%M:%S+00:00");
+    {ok:true, configured:true, invalid:false, units_installed:true, destinations:[
+      {name:"nas", display_name:"Synology NAS", schedule:"*-*-* 03:00:00", running:false, progress:null,
+       repository_display:"rest:http://10.0.0.4:8000/",
+       last_run:{started_at:iso($now-11100), finished_at:iso($now-11040),
+                 duration_seconds:64, exit_code:0, result:"ok",
+                 snapshot_id:"7f21ac9e4b13d05a", files_new:812, files_changed:341,
+                 data_added_bytes:486539264, total_files:1284551, error:null,
+                 log_file:"~/.local/state/omarchy-time-machine/logs/nas/latest.log"},
+       last_success_at:iso($now-11040), snapshot_count:26, repo_size_bytes:201863462912},
+      {name:"usb", display_name:"Drive in my bag", schedule:null, running:false, progress:null,
+       repository_display:"/run/media/backup/restic",
+       last_run:{started_at:iso($now-579600), finished_at:iso($now-578400),
+                 duration_seconds:1204, exit_code:0, result:"ok",
+                 snapshot_id:"c40b18de77a2e5b1", files_new:9044, files_changed:1201,
+                 data_added_bytes:7516192768, total_files:1281003, error:null, log_file:null},
+       last_success_at:iso($now-578400), snapshot_count:9, repo_size_bytes:198642073600},
+      {name:"offsite", display_name:"Offsite", schedule:"*-*-* 04:30:00", running:false, progress:null,
+       repository_display:"s3:s3.eu-central-1.amazonaws.com/attic",
+       last_run:{started_at:iso($now-97200), finished_at:iso($now-95400),
+                 duration_seconds:1783, exit_code:0, result:"ok",
+                 snapshot_id:"1ae55c30bb9f4d72", files_new:602, files_changed:288,
+                 data_added_bytes:314572800, total_files:1283990, error:null, log_file:null},
+       last_success_at:iso($now-95400), snapshot_count:14, repo_size_bytes:203234050048}
+    ]}'
+}
+
+demo_status_running() {
+  # One destination on purpose. A backup in flight is the one screen where the
+  # detail matters -- percentage, bytes, the file being read -- and three rows
+  # of other people's history push it into the noise.
+  jq -nc --argjson now "$(date +%s)" '
+    def iso($t): $t | strftime("%Y-%m-%dT%H:%M:%S+00:00");
+    {ok:true, configured:true, invalid:false, units_installed:true, destinations:[
+      {name:"nas", display_name:"Synology NAS", schedule:"*-*-* 03:00:00", running:true,
+       repository_display:"rest:http://10.0.0.4:8000/",
+       progress:{state:"running", kind:"backup", phase:"backup", percent:0.42,
+                 files_done:184203, total_files:1284551,
+                 bytes_done:81604378624, total_bytes:194358374400,
+                 seconds_elapsed:96, updated_at:iso($now), updated_epoch:$now,
+                 current_file:"/home/alex/Pictures/2026/summer/DSC_4471.raf"},
+       last_run:{finished_at:iso($now-97440), result:"ok", data_added_bytes:486539264},
+       last_success_at:iso($now-97440), snapshot_count:26, repo_size_bytes:201863462912}
+    ]}'
+}
+
+demo_status_failed() {
+  jq -nc --argjson now "$(date +%s)" '
+    def iso($t): $t | strftime("%Y-%m-%dT%H:%M:%S+00:00");
+    {ok:true, configured:true, invalid:false, units_installed:true, destinations:[
+      {name:"nas", display_name:"Synology NAS", schedule:"*-*-* 03:00:00", running:false, progress:null,
+       repository_display:"rest:http://10.0.0.4:8000/",
+       last_run:{finished_at:iso($now-7200), result:"failed", exit_code:10,
+                 error:"repository does not exist: unable to open config file"},
+       last_success_at:iso($now-266400), snapshot_count:26, repo_size_bytes:201863462912},
+      {name:"usb", display_name:"Drive in my bag", schedule:null, running:false, progress:null,
+       repository_display:"/run/media/backup/restic",
+       last_run:{finished_at:iso($now-578400), result:"ok", data_added_bytes:7516192768},
+       last_success_at:iso($now-578400), snapshot_count:9, repo_size_bytes:198642073600},
+      {name:"offsite", display_name:"Offsite", schedule:"*-*-* 04:30:00", running:false, progress:null,
+       repository_display:"s3:s3.eu-central-1.amazonaws.com/attic",
+       last_run:{finished_at:iso($now-11400), result:"ok", data_added_bytes:314572800},
+       last_success_at:iso($now-11400), snapshot_count:14, repo_size_bytes:203234050048}
+    ]}'
+}
+
+demo_snapshots_json() {
+  jq -nc --argjson now "$(date +%s)" '
+    def iso($t): $t | strftime("%Y-%m-%dT%H:%M:%S+00:00");
+    {ok:true, snapshots:[
+      {id:"7f21ac9e4b13d05a8f3c21d94e7b6a05c1f8d3920ab4e56718cd0f23a45b6789", short_id:"7f21ac9e", time:iso($now-11040),  paths:["/home/alex"], summary:{files_new:812}},
+      {id:"5c93de71a204f8b6c3901e4d7a2b58f0c6d1934e78ab52c0d9f3e6a1b74c8250", short_id:"5c93de71", time:iso($now-97440),  paths:["/home/alex"], summary:{files_new:1204}},
+      {id:"2b48f0ac91d635e7f80c2a1b4d97e563a0f81c294de7b350a6c9f2481be05a37", short_id:"2b48f0ac", time:iso($now-183840), paths:["/home/alex"], summary:{files_new:97}},
+      {id:"9e17b3c5d802a4f61b95e0c7d38a24f5091cb6e7a2d80f341c5b9e73a086d2f4", short_id:"9e17b3c5", time:iso($now-270240), paths:["/home/alex"], summary:{files_new:2481}},
+      {id:"438a0e6bc7f19d25a3048b1e6c90d7f2a5831be40cd97f26a1b085c34de7920f", short_id:"438a0e6b", time:iso($now-356640), paths:["/home/alex"], summary:{files_new:663}},
+      {id:"c60d92f448ae13b7f5029d8c1a4e63b70f9128d5ac36e0b41d78f2a59c03e6b18", short_id:"c60d92f4", time:iso($now-961440), paths:["/home/alex"], summary:{files_new:15302}}
+    ]}'
+}
+
+demo_ls_json() {
+  local path="$1"
+  case "$path" in
+    */Documents)
+      jq -nc --arg p "$path" --argjson now "$(date +%s)" '
+        def iso($t): $t | strftime("%Y-%m-%dT%H:%M:%S+00:00");
+        {ok:true, path:$p, truncated:false, entries:[
+          {name:"Contracts",        type:"dir",  path:($p+"/Contracts"),        size:null,    mtime:iso($now-1209600)},
+          {name:"Invoices",         type:"dir",  path:($p+"/Invoices"),         size:null,    mtime:iso($now-604800)},
+          {name:"Photos",           type:"dir",  path:($p+"/Photos"),           size:null,    mtime:iso($now-259200)},
+          {name:"Presentations",    type:"dir",  path:($p+"/Presentations"),    size:null,    mtime:iso($now-172800)},
+          {name:"annual-report.pdf",type:"file", path:($p+"/annual-report.pdf"),size:2418176, mtime:iso($now-345600)},
+          {name:"budget-2026.ods",  type:"file", path:($p+"/budget-2026.ods"),  size:184320,  mtime:iso($now-86400)},
+          {name:"meeting-notes.md", type:"file", path:($p+"/meeting-notes.md"), size:8412,    mtime:iso($now-43200)},
+          {name:"roadmap.excalidraw", type:"file", path:($p+"/roadmap.excalidraw"), size:96231, mtime:iso($now-129600)}
+        ]}' ;;
+    *)
+      jq -nc --arg p "$path" --argjson now "$(date +%s)" '
+        def iso($t): $t | strftime("%Y-%m-%dT%H:%M:%S+00:00");
+        {ok:true, path:$p, truncated:false, entries:[
+          {name:"Documents",  type:"dir", path:($p+"/Documents"),  size:null, mtime:iso($now-43200)},
+          {name:"Downloads",  type:"dir", path:($p+"/Downloads"),  size:null, mtime:iso($now-7200)},
+          {name:"Music",      type:"dir", path:($p+"/Music"),      size:null, mtime:iso($now-2592000)},
+          {name:"Pictures",   type:"dir", path:($p+"/Pictures"),   size:null, mtime:iso($now-604800)},
+          {name:"Projects",   type:"dir", path:($p+"/Projects"),   size:null, mtime:iso($now-3600)},
+          {name:"Videos",     type:"dir", path:($p+"/Videos"),     size:null, mtime:iso($now-1209600)},
+          {name:".zshrc",     type:"file", path:($p+"/.zshrc"),    size:4821, mtime:iso($now-864000)}
+        ]}' ;;
+  esac
+}
+
+cmd_demo() {
+  case "${1:-status}" in
+    on)
+      mkdir -p -m 700 -- "$STATE_DIR"
+      printf '%s\n' "${2:-idle}" | write_private "$DEMO_FILE"
+      printf 'Demo mode is on. Every read returns invented data and every write is a no-op.\n'
+      printf 'Turn it off with: omarchy-time-machine demo off\n'
+      ;;
+    off)
+      rm -f -- "$DEMO_FILE"
+      printf 'Demo mode is off.\n'
+      ;;
+    status)
+      demo_on && printf '%s\n' "$(demo_scene)" || printf 'off\n'
+      ;;
+    *)
+      die "usage: demo on [idle|running|failed] | off | status"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<TEXT
+omarchy-time-machine $VERSION
+
+  status --json                       status of every destination (no network)
+  destinations --json                 configured destinations
+  key set|show --dest <name>          manage the repository password
+  init --dest <name>                  create the repository
+  backup [--dest <name>] [--dry-run]  run a backup
+  snapshots --dest <name> --json      list snapshots
+  ls --dest <name> --snapshot <id> --path </abs> --json
+  restore --dest <name> --snapshot <id> --path </abs> [--target <dir>]
+  check --dest <name>                 verify repository integrity
+  install                             (re)write and enable the systemd units
+  config create                       write a starter configuration
+  log [--dest <name>]                 path of the most recent log file
+  demo on|off|status                  invented data for screenshots; writes become no-ops
+TEXT
+}
+
+main() {
+  need jq
+  local command="${1:-}"
+  [ "$#" -gt 0 ] && shift
+
+  case "$command" in
+    status) cmd_status "$@" ;;
+    destinations) cmd_destinations "$@" ;;
+    key) cmd_key "$@" ;;
+    init) need restic; cmd_init "$@" ;;
+    backup) need restic; cmd_backup "$@" ;;
+    snapshots) need restic; cmd_snapshots "$@" ;;
+    ls) need restic; cmd_ls "$@" ;;
+    restore) need restic; cmd_restore "$@" ;;
+    check) need restic; cmd_check "$@" ;;
+    install) cmd_install "$@" ;;
+    report-failure) cmd_report_failure "$@" ;;
+    log) cmd_log "$@" ;;
+    config) cmd_config "$@" ;;
+    demo) cmd_demo "$@" ;;
+    --version) printf '%s\n' "$VERSION" ;;
+    ""|help|--help|-h) usage ;;
+    *) printf 'unknown command: %s\n' "$command" >&2; usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"

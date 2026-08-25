@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "jankeesvw.time-machine",
+  "name": "Time Machine",
+  "version": "1.0.0",
+  "author": "Jankees",
+  "description": "Scheduled restic backups with a destination picker and a snapshot browser",
+  "homepage": "https://github.com/jankeesvw/omarchy-time-machine",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Time Machine",
+    "description": "Scheduled restic backups with a destination picker and a snapshot browser",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
