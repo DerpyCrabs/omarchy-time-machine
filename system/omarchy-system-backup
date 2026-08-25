@@ -2,12 +2,12 @@
 set -euo pipefail
 umask 077
 
-CONFIG_FILE=/etc/omarchy-system-backup.conf
-STATE_DIR=/var/lib/omarchy-system-backup
+CONFIG_FILE="${OMARCHY_SYSTEM_BACKUP_CONFIG:-/etc/omarchy-system-backup.conf}"
+STATE_DIR="${OMARCHY_SYSTEM_BACKUP_STATE_DIR:-/var/lib/omarchy-system-backup}"
 STATUS_FILE="$STATE_DIR/status.json"
 LOG_DIR="$STATE_DIR/logs"
 MANIFEST_DIR="$STATE_DIR/manifests"
-CACHE_DIR=/var/cache/omarchy-system-backup
+CACHE_DIR="${OMARCHY_SYSTEM_BACKUP_CACHE_DIR:-/var/cache/omarchy-system-backup}"
 
 [ "$(id -u)" -eq 0 ] || { printf 'This command must run as root.\n' >&2; exit 1; }
 [ -r "$CONFIG_FILE" ] || { printf 'Missing %s\n' "$CONFIG_FILE" >&2; exit 1; }

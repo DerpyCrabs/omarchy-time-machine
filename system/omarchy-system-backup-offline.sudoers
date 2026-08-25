@@ -1,0 +1,3 @@
+# Let the desktop user's detached-backup unit append the small privileged
+# system-state snapshot. No arguments, alternate units, or shell are allowed.
+crab ALL=(root) NOPASSWD: /usr/bin/systemctl start --wait omarchy-system-backup-offline.service
