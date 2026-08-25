@@ -56,6 +56,15 @@ SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 LOG_RETENTION_DAYS=30
 PRE_COMMAND_TIMEOUT=60
 LS_ENTRY_CAP=500
+# What restic is allowed to hand back before anything reads it. LS_ENTRY_CAP
+# bounds the rows the widget draws, which is a different job: by the time it
+# applies, the whole listing has already been read into a shell variable and
+# slurped a second time by jq. A directory of 60k children measured 25 MiB of
+# output and 215 MiB of peak RSS for a panel showing 500 rows. These two cap
+# the read itself. LS_LINE_CAP sits well above LS_ENTRY_CAP so sorting still
+# has a pool to sort, and truncated stays honest either way.
+LS_LINE_CAP=5000
+SNAPSHOT_CAP=200
 PROGRESS_INTERVAL_MS=500
 STALE_PROGRESS_SECONDS=10
 
@@ -965,7 +974,10 @@ cmd_snapshots() {
   run_pre_command
 
   local out
-  out="$(restic_run snapshots --json 2>/dev/null)"
+  # A retention policy keeps this in the tens, so --latest is a ceiling rather
+  # than a limit anybody meets. It is here because "the repository decides how
+  # much memory this costs" is the wrong default, not because the number bites.
+  out="$(restic_run snapshots --json --latest "$SNAPSHOT_CAP" 2>/dev/null)"
   [ -n "$out" ] || { jq -nc '{ok:false, error:"could not read snapshots", snapshots:[]}'; return 0; }
 
   jq -c '{ok:true, snapshots:([.[] | {id, short_id, time, paths, summary}] | reverse)}' <<<"$out" 2>/dev/null ||
@@ -990,7 +1002,10 @@ cmd_ls() {
   run_pre_command
 
   local out
-  out="$(restic_run ls --json -- "$OPT_SNAPSHOT" "$path" 2>/dev/null)"
+  # restic writes one JSON object per line, so a line ceiling cuts cleanly --
+  # no half object for jq to choke on -- and it bounds the read before bash or
+  # jq ever hold it.
+  out="$(restic_run ls --json -- "$OPT_SNAPSHOT" "$path" 2>/dev/null | head -n "$LS_LINE_CAP")"
   [ -n "$out" ] ||
     { jq -nc --arg p "$path" '{ok:false, error:"could not list snapshot", path:$p, entries:[]}'; return 0; }
 

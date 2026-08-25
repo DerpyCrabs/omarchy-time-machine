@@ -172,6 +172,54 @@ $CLI restore --dest test --snapshot "$SNAP" --path "$WORK/src/docs/report.md" --
 [ "$(cat "$WORK/restored$WORK/src/docs/report.md" 2>/dev/null)" = "report" ]
 check $? "restore writes the file into the target directory"
 
+# --- large listings --------------------------------------------------------
+#
+# restic decides how much output a listing produces, and until it is capped at
+# the pipe the whole thing is read into a shell variable and then slurped a
+# second time by jq. A directory of 60k children measured 25 MiB of output and
+# 215 MiB of peak RSS to draw 500 rows. Cutting the stream at a line boundary
+# is what keeps that bounded -- and what could just as easily hand jq a half
+# object, which is the part worth pinning down.
+
+group "Large listings"
+
+mkdir -p "$WORK/src/many"
+(cd "$WORK/src/many" && seq 1 6000 | xargs -P8 -n1000 touch)
+$CLI backup --dest test >/dev/null 2>&1
+BIGSNAP="$($CLI snapshots --dest test --json | jq -r '.snapshots[0].id')"
+BIGLS="$($CLI ls --dest test --snapshot "$BIGSNAP" --path "$WORK/src/many" --json)"
+
+jq -e '.ok == true' <<<"$BIGLS" >/dev/null 2>&1
+check $? "a listing cut at the line cap is still valid JSON, not a half object"
+
+jq -e '.entries | length == 500' <<<"$BIGLS" >/dev/null 2>&1
+check $? "and it is capped at LS_ENTRY_CAP rows"
+
+jq -e '.truncated == true' <<<"$BIGLS" >/dev/null 2>&1
+check $? "and says so, rather than presenting a partial listing as complete"
+
+# --- untrusted text in shell components ------------------------------------
+#
+# Filenames come out of the backup, and a Text with no textFormat falls back to
+# Qt's AutoText, which renders anything tag-shaped as rich text and fetches
+# what it points at. ConfirmDialog is a shell component that sets no
+# textFormat, so the escaping has to happen on this side. Asserted against the
+# source because there is no QML runtime in this suite to render it.
+
+group "Untrusted text in shell components"
+
+BROWSER="$(dirname "$CLI")/../RestoreBrowser.qml"
+
+grep -q 'TimeMachineStore\.plain(root\.restoreTargetName)' "$BROWSER"
+check $? "a filename reaches ConfirmDialog through plain()"
+
+grep -qE '\+ *root\.restoreTargetName|root\.restoreTargetName *\+' "$BROWSER"
+[ $? -ne 0 ]
+check $? "and nowhere is it concatenated into a string raw"
+
+grep -q 'replace(/\[<>\]/g' "$(dirname "$CLI")/../TimeMachineStore.qml"
+check $? "and plain() is what strips the characters that make Qt see markup"
+
 # --- input validation ------------------------------------------------------
 #
 # Snapshot ids and paths travel from the widget back into restic. They are

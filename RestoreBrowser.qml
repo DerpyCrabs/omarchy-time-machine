@@ -536,9 +536,13 @@ FocusScope {
     z: 10
     // The full destination is spelled out, because the one thing worth
     // confirming here is where the files land -- never on top of the original.
+    // plain(): the name is a filename out of the backup, and ConfirmDialog is a
+    // shell component that sets no textFormat -- so its Text falls back to
+    // Qt's AutoText, which renders anything tag-shaped as rich text and would
+    // fetch what it points at. Same reason the bar tooltip goes through plain().
     message: root.restoreTargetName !== ""
-             ? "Restore \u201C" + root.restoreTargetName + "\u201D into ~/Restored? "
-               + "Nothing outside that folder is touched."
+             ? "Restore \u201C" + TimeMachineStore.plain(root.restoreTargetName)
+               + "\u201D into ~/Restored? Nothing outside that folder is touched."
              : ""
     confirmText: "Restore"
     fontFamily: root.fontFamily

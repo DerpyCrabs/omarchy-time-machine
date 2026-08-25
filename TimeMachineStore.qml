@@ -514,9 +514,10 @@ Singleton {
   // --- formatting ---------------------------------------------------------
 
   function plain(value) {
-    // Anything heading for the shared bar tooltip, whose textFormat is not
-    // ours to set. Our own strings are safe, but a destination name comes out
-    // of config.json and a message comes out of restic.
+    // Anything heading for a shell component whose textFormat is not ours to
+    // set -- the bar tooltip, ConfirmDialog. Our own strings are safe, but a
+    // destination name comes out of config.json, a message comes out of
+    // restic, and a filename comes out of the backup itself.
     return String(value === undefined || value === null ? "" : value).replace(/[<>]/g, "")
   }
 
