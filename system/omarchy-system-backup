@@ -7,6 +7,7 @@ STATE_DIR=/var/lib/omarchy-system-backup
 STATUS_FILE="$STATE_DIR/status.json"
 LOG_DIR="$STATE_DIR/logs"
 MANIFEST_DIR="$STATE_DIR/manifests"
+CACHE_DIR=/var/cache/omarchy-system-backup
 
 [ "$(id -u)" -eq 0 ] || { printf 'This command must run as root.\n' >&2; exit 1; }
 [ -r "$CONFIG_FILE" ] || { printf 'Missing %s\n' "$CONFIG_FILE" >&2; exit 1; }
@@ -22,7 +23,7 @@ source "$CONFIG_FILE"
 : "${BACKUP_UUID:?BACKUP_UUID is required}"
 : "${PARTITION_DEVICE:=/dev/nvme0n1}"
 
-install -d -o root -g root -m 0700 "$STATE_DIR" "$LOG_DIR" "$MANIFEST_DIR"
+install -d -o root -g root -m 0700 "$STATE_DIR" "$LOG_DIR" "$MANIFEST_DIR" "$CACHE_DIR"
 
 mode="${1:-backup}"
 case "$mode" in
@@ -108,6 +109,7 @@ findmnt -rn -S "UUID=$BACKUP_UUID" -T "$BACKUP_MOUNT" >/dev/null
 [ -r "$RESTIC_PASSWORD_FILE" ]
 
 export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+export RESTIC_CACHE_DIR="$CACHE_DIR"
 
 capture_manifests() {
   pacman -Qqen > "$MANIFEST_DIR/pacman-explicit-native.txt"
