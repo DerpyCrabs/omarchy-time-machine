@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up Omarchy system state
+Documentation=https://github.com/DerpyCrabs/omarchy-time-machine
+After=local-fs.target
+RequiresMountsFor=/mnt/backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/omarchy-system-backup backup
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle

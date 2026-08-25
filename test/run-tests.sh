@@ -371,7 +371,7 @@ check $? "the service does not excuse restic exit 3"
 # install exits non-zero here because systemd cannot enable a unit under a
 # redirected XDG_CONFIG_HOME. What is under test is that it rewrites nothing.
 OUT="$($CLI install 2>&1)"
-[ "$(grep -c 'unchanged' <<<"$OUT")" = "3" ]
+[ "$(grep -c 'unchanged' <<<"$OUT")" = "7" ]
 check $? "install rewrites nothing on a second run"
 
 if command -v systemd-analyze >/dev/null 2>&1; then
@@ -419,6 +419,65 @@ jq '.destinations += [{name:"broken", repository:"/nonexistent/repo"}]' \
   "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
 $CLI status --json | jq -e '.ok == true and (.destinations | length) == 3' >/dev/null 2>&1
 check $? "a broken destination does not break status for the rest"
+
+# --- mount identity and removable-drive controls --------------------------
+
+group "Mount identity and destination controls"
+
+ROOT_UUID="$(findmnt -nro UUID -T / | tail -1)"
+cp "$CONFIG" "$WORK/config.before-mounts"
+jq --arg uuid "$ROOT_UUID" '
+  .destinations[0].required_mounts = [{path:"/", uuid:$uuid}]
+' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+
+$CLI status --json | jq -e '.destinations[0].repository_available == true' >/dev/null 2>&1
+check $? "status confirms a required filesystem by UUID"
+
+jq '.destinations[0].required_mounts[0].uuid = "00000000-0000-0000-0000-000000000000"' \
+  "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+OUT="$($CLI backup --dest test --dry-run 2>&1)"
+grep -q 'is not mounted at /' <<<"$OUT"
+check $? "backup fails closed when the mountpoint has the wrong filesystem"
+
+jq '.destinations[0].eject = {
+      path:"/mnt/offline-test", uuid:"00000000-0000-0000-0000-000000000000"
+    }' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+rm -f "$XDG_STATE_HOME/omarchy-time-machine/progress-test.json"
+$CLI eject --dest test --json | jq -e '.ok == true and .already_offline == true' >/dev/null 2>&1
+check $? "eject is harmless when the configured removable drive is already offline"
+
+STORE="$(dirname "$CLI")/../TimeMachineStore.qml"
+PANEL="$(dirname "$CLI")/../Panel.qml"
+grep -q 'startAllProc.command = command' "$STORE"
+check $? "global start uses one systemctl process rather than reusing one Process in a loop"
+grep -q 'function stopOne(name)' "$STORE"
+check $? "a destination can be stopped by name"
+grep -q 'TimeMachineStore.startOne(String(modelData.name))' "$PANEL"
+check $? "the panel exposes a per-destination backup action"
+
+cp "$WORK/config.before-mounts" "$CONFIG"
+
+# --- status-only system jobs ----------------------------------------------
+
+group "System job status"
+
+SYSTEM_STATUS="$WORK/system-status.json"
+cat > "$SYSTEM_STATUS" <<JSON
+{"last_run":{"result":"ok","finished_at":"2026-08-25T03:00:00+03:00"},"last_success_at":"2026-08-25T03:00:00+03:00"}
+JSON
+jq --arg status "$SYSTEM_STATUS" '.system_jobs = [{
+      name:"system-state", display_name:"System state",
+      service:"omarchy-system-backup-test.service", status_file:$status
+    }]' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+
+$CLI status --json | jq -e '
+  .system_jobs[0].name == "system-state"
+  and .system_jobs[0].status_only == true
+  and .system_jobs[0].last_run.result == "ok"
+' >/dev/null 2>&1
+check $? "status includes a read-only root system job"
+
+jq 'del(.system_jobs)' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
 
 cp "$WORK/config.bak" "$CONFIG"
 

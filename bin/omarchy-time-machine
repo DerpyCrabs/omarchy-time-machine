@@ -20,6 +20,7 @@
 #   omarchy-time-machine ls --dest N --snapshot ID --path /abs --json
 #   omarchy-time-machine restore --dest N --snapshot ID --path P [--target DIR]
 #   omarchy-time-machine check --dest N
+#   omarchy-time-machine eject --dest N          safely unmount a removable destination
 #   omarchy-time-machine install               write and enable the systemd units
 #   omarchy-time-machine log [--dest N]
 #
@@ -44,7 +45,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.1.0-crab.1"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-time-machine"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-time-machine"
@@ -91,6 +92,7 @@ JSON_MODE=0
 SUMMARY_FILE=""
 ERROR_FILE=""
 UNREADABLE_FILE=""
+RESTORE_TEST_TARGET=""
 
 # die() must only ever be called from the main shell, never from inside a
 # command substitution: there it would exit the subshell and the caller would
@@ -266,12 +268,13 @@ OPT_SNAPSHOT=""
 OPT_PATH=""
 OPT_TARGET=""
 OPT_VAULT=""
+OPT_READ_DATA_SUBSET=""
 OPT_DRY_RUN=0
 OPT_JSON=0
 declare -a POSITIONAL=()
 
 parse_options() {
-  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_VAULT=""; OPT_DRY_RUN=0; OPT_JSON=0
+  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_VAULT=""; OPT_READ_DATA_SUBSET=""; OPT_DRY_RUN=0; OPT_JSON=0
   POSITIONAL=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -280,6 +283,7 @@ parse_options() {
       --path) OPT_PATH="${2:-}"; shift 2 || shift ;;
       --target) OPT_TARGET="${2:-}"; shift 2 || shift ;;
       --vault) OPT_VAULT="${2:-}"; shift 2 || shift ;;
+      --read-data-subset) OPT_READ_DATA_SUBSET="${2:-}"; shift 2 || shift ;;
       --dry-run) OPT_DRY_RUN=1; shift ;;
       --json) OPT_JSON=1; shift ;;
       *) POSITIONAL+=("$1"); shift ;;
@@ -316,6 +320,43 @@ config_problem() {
       elif ($names | length) != ($names | unique | length)
       then "duplicate destination names: " + (($names | group_by(.) | map(select(length > 1) | .[0])) | join(", "))
       else "" end' <<<"$json" 2>/dev/null)"
+
+  if [ -z "$problem" ] && ! jq -e '
+    all(.destinations[];
+      ((.required_mounts // []) | type) == "array"
+      and all((.required_mounts // [])[];
+        (.path | type) == "string"
+        and (.path | startswith("/"))
+        and (.uuid | type) == "string"
+        and (.uuid | test("^[A-Fa-f0-9-]+$"))))
+  ' >/dev/null 2>&1 <<<"$json"; then
+    problem="required_mounts entries need an absolute path and a filesystem UUID"
+  fi
+
+  if [ -z "$problem" ] && ! jq -e '
+    all(.destinations[];
+      (.eject == null)
+      or ((.eject | type) == "object"
+          and (.eject.path | type) == "string"
+          and (.eject.path | startswith("/"))
+          and (.eject.uuid | type) == "string"
+          and (.eject.uuid | test("^[A-Fa-f0-9-]+$"))))
+  ' >/dev/null 2>&1 <<<"$json"; then
+    problem="eject needs an absolute path and a filesystem UUID"
+  fi
+
+  if [ -z "$problem" ] && ! jq -e '
+    ((.system_jobs // []) | type) == "array"
+    and all((.system_jobs // [])[];
+      (.name | type) == "string"
+      and (.name | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+      and (.service | type) == "string"
+      and (.service | test("^[A-Za-z0-9@_.:-]+\\.service$"))
+      and (.status_file | type) == "string"
+      and (.status_file | startswith("/")))
+  ' >/dev/null 2>&1 <<<"$json"; then
+    problem="system_jobs entries need a safe name, a .service unit, and an absolute status_file"
+  fi
 
   [ -z "$problem" ] && return 0
   printf '%s' "$problem"
@@ -368,6 +409,51 @@ keep_value() {
   value="$(jq -r --arg k "$key" '.retention[$k] // empty' <<<"$DEST_JSON" 2>/dev/null)"
   [ -n "$value" ] || value="$(jq -r --arg k "$key" '.retention[$k] // empty' <<<"$CONFIG_JSON" 2>/dev/null)"
   number_or "$value" "$fallback"
+}
+
+# A local repository path must never degrade into an ordinary directory on
+# the root filesystem when its disk is absent. Each configured mount is
+# identified by both its stable path and filesystem UUID. The status path is
+# read-only and never wakes a drive; backup commands deliberately traverse the
+# mountpoint first so a systemd automount can do its job.
+mount_is_present() {
+  local path="$1" uuid="$2"
+  findmnt -rn -S "UUID=$uuid" -T "$path" >/dev/null 2>&1
+}
+
+require_destination_mounts() {
+  local path uuid count=0
+  while IFS=$'\t' read -r path uuid; do
+    [ -n "$path" ] || continue
+    count=$((count + 1))
+    [ -d "$path" ] || die "required mount path is missing: $path"
+    # Entering the directory triggers x-systemd.automount without reading any
+    # source files. An empty unmounted directory still passes this operation,
+    # which is why the UUID check below is the actual guard.
+    ls -d -- "$path/." >/dev/null 2>&1 || die "required mount is not accessible: $path"
+    mount_is_present "$path" "$uuid" ||
+      die "required filesystem $uuid is not mounted at $path"
+  done < <(jq -r '.required_mounts[]? | [.path, .uuid] | @tsv' <<<"$DEST_JSON" 2>/dev/null)
+  return 0
+}
+
+DESTINATION_AVAILABLE=null
+destination_availability() {
+  local path uuid count=0 wake=false
+  [ "$(jq -r 'if .eject == null then true else false end' <<<"$DEST_JSON")" = "true" ] && wake=true
+  DESTINATION_AVAILABLE=true
+  while IFS=$'\t' read -r path uuid; do
+    [ -n "$path" ] || continue
+    count=$((count + 1))
+    # Internal systemd automounts should resolve in the panel. A removable
+    # destination must stay asleep until the user explicitly starts it.
+    [ "$wake" = "false" ] || ls -d -- "$path/." >/dev/null 2>&1
+    if ! mount_is_present "$path" "$uuid"; then
+      DESTINATION_AVAILABLE=false
+      return 0
+    fi
+  done < <(jq -r '.required_mounts[]? | [.path, .uuid] | @tsv' <<<"$DEST_JSON" 2>/dev/null)
+  [ "$count" -gt 0 ] || DESTINATION_AVAILABLE=null
 }
 
 # ---------------------------------------------------------------------------
@@ -865,6 +951,29 @@ cmd_destinations() {
   jq -nc --argjson d "$out" '{ok:true, destinations:$d}'
 }
 
+system_jobs_status() {
+  local out='[]' job name label service status_file stored running
+  while IFS= read -r job; do
+    [ -n "$job" ] || continue
+    name="$(jq -r '.name' <<<"$job")"
+    label="$(jq -r '.display_name // .name' <<<"$job")"
+    service="$(jq -r '.service' <<<"$job")"
+    status_file="$(jq -r '.status_file' <<<"$job")"
+    stored="$(read_json_or "$status_file" '{}')"
+    running=false
+    systemctl --quiet is-active "$service" >/dev/null 2>&1 && running=true
+    out="$(jq -c \
+      --arg name "$name" \
+      --arg label "$label" \
+      --arg service "$service" \
+      --argjson stored "$stored" \
+      --argjson running "$running" \
+      '. + [$stored + {name:$name, display_name:$label, service:$service,
+                       running:$running, status_only:true}]' <<<"$out")"
+  done < <(cfg '.system_jobs[]? | @json' 2>/dev/null)
+  printf '%s' "$out"
+}
+
 
 # The only call the widget makes on a timer. Deliberately touches no network
 # and no key file: configuration, status.json and the progress file, no more.
@@ -873,7 +982,7 @@ cmd_status() {
   demo_on && { demo_status_json; return 0; }
   if ! user_file "$CONFIG_FILE"; then
     jq -nc --arg e "no configuration at $CONFIG_FILE" \
-      '{ok:true, configured:false, invalid:false, error:$e, destinations:[]}'
+      '{ok:true, configured:false, invalid:false, error:$e, destinations:[], system_jobs:[]}'
     return 0
   fi
 
@@ -883,12 +992,13 @@ cmd_status() {
   local problem
   if ! problem="$(config_problem "$(cat -- "$CONFIG_FILE")")"; then
     jq -nc --arg e "$problem" \
-      '{ok:true, configured:false, invalid:true, error:$e, destinations:[]}'
+      '{ok:true, configured:false, invalid:true, error:$e, destinations:[], system_jobs:[]}'
     return 0
   fi
   load_config
 
   local status active out name progress running epoch age updated installed repo
+  local removable eject_path system_jobs
   status="$(load_status)"
   epoch="$(date +%s)"
   out='[]'
@@ -902,6 +1012,7 @@ cmd_status() {
 
   while IFS= read -r name; do
     [ -n "$name" ] || continue
+    select_destination "$name"
     progress="$(read_json_or "$STATE_DIR/progress-$name.json" 'null')"
     running=false
 
@@ -920,6 +1031,9 @@ cmd_status() {
     fi
 
     repo="$(sanitize_repository "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .repository // ""' <<<"$CONFIG_JSON")")"
+    destination_availability
+    removable="$(dest 'if .eject == null then false else true end')"
+    eject_path="$(dest '.eject.path // empty')"
 
     out="$(jq -c \
       --arg name "$name" \
@@ -928,22 +1042,31 @@ cmd_status() {
       --argjson stored "$(jq -c --arg n "$name" '.destinations[$n] // {}' <<<"$status")" \
       --arg schedule "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .schedule // ""' <<<"$CONFIG_JSON")" \
       --argjson running "$running" \
+      --argjson available "$DESTINATION_AVAILABLE" \
+      --argjson removable "$removable" \
+      --arg eject_path "$eject_path" \
       --argjson progress "$progress" \
       '. + [$stored + {name:$name, display_name:$label,
                        schedule:(if $schedule == "" then null else $schedule end),
                        running:$running,
+                       repository_available:$available,
+                       removable:$removable,
+                       eject_path:(if $eject_path == "" then null else $eject_path end),
                        repository_display:(if $repo == "" then ($stored.repository_display // "") else $repo end),
                        progress:(if $running then $progress else null end)}]' <<<"$out")"
   done < <(cfg '.destinations[].name')
 
-  jq -nc --argjson d "$out" --argjson installed "$installed" \
-    '{ok:true, configured:true, invalid:false, units_installed:$installed, destinations:$d}'
+  system_jobs="$(system_jobs_status)"
+  jq -nc --argjson d "$out" --argjson jobs "$system_jobs" --argjson installed "$installed" \
+    '{ok:true, configured:true, invalid:false, units_installed:$installed,
+      destinations:$d, system_jobs:$jobs}'
 }
 
 cmd_init() {
   parse_options "$@"
   load_config
   select_destination "$OPT_DEST"
+  require_destination_mounts
   config_dir_secure
   private_dir "$STATE_DIR" logs
   restic_context
@@ -959,9 +1082,135 @@ cmd_check() {
   parse_options "$@"
   load_config
   select_destination "$OPT_DEST"
+  require_destination_mounts
   restic_context
   run_pre_command
-  restic_run check
+  local -a args=(check)
+  if [ -n "$OPT_READ_DATA_SUBSET" ]; then
+    [[ "$OPT_READ_DATA_SUBSET" =~ ^([0-9]+%|[0-9]+/[0-9]+)$ ]] ||
+      die "invalid --read-data-subset value"
+    args+=("--read-data-subset=$OPT_READ_DATA_SUBSET")
+  fi
+  restic_run "${args[@]}"
+}
+
+cmd_verify_restore() {
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  require_destination_mounts
+  restic_context
+  run_pre_command
+
+  local root path uuid snapshot target entry
+  local -a includes
+  root="$(expand_tilde "$(cfg '.restore_test.root // empty')")"
+  path="$(cfg '.restore_test.mount.path // empty')"
+  uuid="$(cfg '.restore_test.mount.uuid // empty')"
+  [ -n "$root" ] && [ -n "$path" ] && [ -n "$uuid" ] ||
+    die "restore_test needs root and mount path/uuid settings"
+  [ -d "$path" ] || die "restore-test mount path is missing: $path"
+  ls -d -- "$path/." >/dev/null 2>&1
+  mount_is_present "$path" "$uuid" ||
+    die "restore-test filesystem $uuid is not mounted at $path"
+
+  includes=()
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    validate_absolute_path "$entry"
+    [ -e "$entry" ] || die "restore-test source is missing: $entry"
+    includes+=("$entry")
+  done < <(cfg '.restore_test.paths[]? // empty')
+  [ "${#includes[@]}" -gt 0 ] || die "restore_test.paths is empty"
+
+  snapshot="$(restic_run snapshots --latest 1 --json | jq -r '.[0].id // empty')"
+  [ -n "$snapshot" ] || die "repository has no snapshot to restore"
+  install -d -m 0700 "$root"
+  target="$(mktemp -d "$root/user-data.XXXXXX")"
+  RESTORE_TEST_TARGET="$target"
+  trap 'rm -rf -- "${RESTORE_TEST_TARGET:?}"' EXIT
+
+  local -a restore_args=(restore --target "$target")
+  for entry in "${includes[@]}"; do restore_args+=(--include "$entry"); done
+  restore_args+=(-- "$snapshot")
+  restic_run "${restore_args[@]}"
+
+  for entry in "${includes[@]}"; do
+    diff -qr --no-dereference -- "$entry" "$target$entry" >/dev/null ||
+      die "restored content differs from $entry"
+  done
+  printf 'Verified %s item(s) from snapshot %s in %s\n' \
+    "${#includes[@]}" "${snapshot:0:12}" "$target"
+}
+
+cmd_eject() {
+  parse_options "$@"
+  [ "$OPT_JSON" = "1" ] && JSON_MODE=1
+  load_config
+  select_destination "$OPT_DEST"
+
+  local path uuid progress updated age source parent power_device
+  path="$(dest '.eject.path // empty')"
+  uuid="$(dest '.eject.uuid // empty')"
+  [ -n "$path" ] && [ -n "$uuid" ] ||
+    die "$DEST_NAME is not configured as a removable destination"
+
+  if systemctl --user --quiet is-active "omarchy-time-machine@$DEST_NAME.service" 2>/dev/null; then
+    die "backup to $DEST_NAME is still running"
+  fi
+
+  progress="$(read_json_or "$STATE_DIR/progress-$DEST_NAME.json" 'null')"
+  if [ "$(jq -r 'if type == "object" then (.state // "") else "" end' <<<"$progress" 2>/dev/null)" = "running" ]; then
+    updated="$(number_or "$(jq -r '.updated_epoch // 0' <<<"$progress" 2>/dev/null)" 0)"
+    age=$(( $(date +%s) - updated ))
+    [ "$updated" -le 0 ] || [ "$age" -ge "$STALE_PROGRESS_SECONDS" ] ||
+      die "backup to $DEST_NAME is still running"
+  fi
+
+  if ! mount_is_present "$path" "$uuid"; then
+    if [ "$OPT_JSON" = "1" ]; then
+      jq -nc --arg n "$DEST_NAME" '{ok:true, destination:$n, already_offline:true}'
+    else
+      printf '%s is already offline.\n' "$DEST_NAME"
+    fi
+    return 0
+  fi
+
+  source="$(findmnt -rn -S "UUID=$uuid" -T "$path" -o SOURCE | tail -1)"
+  [ -b "$source" ] || die "refusing to eject unexpected mount source: $source"
+  [ "$(lsblk -dn -o UUID "$source" | xargs)" = "$uuid" ] ||
+    die "mounted device UUID changed while preparing to eject"
+
+  parent="$(lsblk -dn -o PKNAME "$source" | xargs)"
+  power_device="$source"
+  [ -n "$parent" ] && power_device="/dev/$parent"
+
+  sync -f "$path"
+  udisksctl unmount -b "$source" >/dev/null || die "could not unmount $source"
+  udevadm settle
+  findmnt -rn -S "UUID=$uuid" >/dev/null 2>&1 &&
+    die "$source still appears mounted after unmount"
+
+  if ! udisksctl power-off -b "$power_device" >/dev/null 2>&1; then
+    # Unmounted is safe to unplug even when the enclosure does not implement
+    # UDisks power-off. Report that distinction instead of calling the whole
+    # operation a failure after its important part already succeeded.
+    if [ "$OPT_JSON" = "1" ]; then
+      jq -nc --arg n "$DEST_NAME" --arg d "$power_device" \
+        '{ok:true, destination:$n, unmounted:true, powered_off:false, device:$d}'
+    else
+      printf '%s is unmounted and safe to unplug; %s did not support power-off.\n' \
+        "$DEST_NAME" "$power_device"
+    fi
+    return 0
+  fi
+
+  if [ "$OPT_JSON" = "1" ]; then
+    jq -nc --arg n "$DEST_NAME" --arg d "$power_device" \
+      '{ok:true, destination:$n, unmounted:true, powered_off:true, device:$d}'
+  else
+    printf '%s is unmounted, powered off, and safe to unplug.\n' "$DEST_NAME"
+  fi
 }
 
 cmd_snapshots() {
@@ -970,6 +1219,7 @@ cmd_snapshots() {
   parse_options "$@"
   load_config
   select_destination "$OPT_DEST"
+  require_destination_mounts
   restic_context
   run_pre_command
 
@@ -998,6 +1248,7 @@ cmd_ls() {
 
   load_config
   select_destination "$OPT_DEST"
+  require_destination_mounts
   restic_context
   run_pre_command
 
@@ -1036,6 +1287,7 @@ cmd_backup() {
   parse_options "$@"
   load_config
   select_destination "$OPT_DEST"
+  require_destination_mounts
   config_dir_secure
   private_dir "$STATE_DIR" logs
   open_log
@@ -1470,6 +1722,12 @@ cmd_report_failure() {
   return 0
 }
 
+cmd_report_maintenance_failure() {
+  local job="${1:-maintenance}"
+  notify -u critical -t 0 -i "$(icon_for icon)" -- \
+    "Backup maintenance failed" "$job failed. Open the Time Machine logs or systemd journal for details."
+}
+
 # Opens a file manager with the given path selected in its parent folder --
 # the thing you actually want after a restore, rather than being told a path
 # and having to go find it yourself.
@@ -1520,6 +1778,7 @@ cmd_restore() {
 
   load_config
   select_destination "$OPT_DEST"
+  require_destination_mounts
   restic_context
 
   # Never in place. A restore must not be able to erase work created after the
@@ -1662,6 +1921,71 @@ ExecStart=$SELF report-failure --dest %i
 UNIT
 }
 
+check_unit() {
+  local data_flag="${1:-}"
+  cat <<UNIT
+[Unit]
+Description=Check Time Machine repository %i
+After=network-online.target
+Wants=network-online.target
+OnFailure=omarchy-time-machine-maintenance-failed@check-%i.service
+
+[Service]
+Type=oneshot
+Environment=PATH=$(unit_path_env)
+ExecStart=$SELF check --dest %i $data_flag
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle
+UNIT
+}
+
+restore_test_unit() {
+  cat <<UNIT
+[Unit]
+Description=Test restore from Time Machine repository %i
+After=network-online.target
+Wants=network-online.target
+OnFailure=omarchy-time-machine-maintenance-failed@restore-%i.service
+
+[Service]
+Type=oneshot
+Environment=PATH=$(unit_path_env)
+ExecStart=$SELF verify-restore --dest %i
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle
+UNIT
+}
+
+maintenance_failed_unit() {
+  cat <<UNIT
+[Unit]
+Description=Report failed Time Machine maintenance for %i
+
+[Service]
+Type=oneshot
+Environment=PATH=$(unit_path_env)
+ExecStart=$SELF report-maintenance-failure %i
+UNIT
+}
+
+maintenance_timer_unit() {
+  local description="$1" service="$2" schedule="$3"
+  cat <<UNIT
+[Unit]
+Description=$description
+
+[Timer]
+Unit=$service
+OnCalendar=$schedule
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
 timer_unit() {
   local name="$1" schedule="$2" delay="$3"
   cat <<UNIT
@@ -1709,8 +2033,13 @@ cmd_install() {
   printf 'Writing units into %s:\n' "$SYSTEMD_DIR"
   write_unit "omarchy-time-machine@.service" "$(service_unit)"
   write_unit "omarchy-time-machine-failed@.service" "$(failed_unit)"
+  write_unit "omarchy-time-machine-check@.service" "$(check_unit)"
+  write_unit "omarchy-time-machine-check-data@.service" "$(check_unit '--read-data-subset 5%%')"
+  write_unit "omarchy-time-machine-restore-test@.service" "$(restore_test_unit)"
+  write_unit "omarchy-time-machine-maintenance-failed@.service" "$(maintenance_failed_unit)"
 
-  local names=() name schedule delay unit path filename keep
+  local names=() maintenance_units=() name schedule delay unit path filename keep
+  local check_schedule data_schedule restore_schedule
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     schedule="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .schedule // ""' <<<"$CONFIG_JSON")"
@@ -1718,6 +2047,25 @@ cmd_install() {
     delay="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .randomized_delay // "15m"' <<<"$CONFIG_JSON")"
     names+=("$name")
     write_unit "omarchy-time-machine@$name.timer" "$(timer_unit "$name" "$schedule" "$delay")"
+
+    check_schedule="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .maintenance.check_schedule // empty' <<<"$CONFIG_JSON")"
+    data_schedule="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .maintenance.data_check_schedule // empty' <<<"$CONFIG_JSON")"
+    restore_schedule="$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .maintenance.restore_test_schedule // empty' <<<"$CONFIG_JSON")"
+    if [ -n "$check_schedule" ]; then
+      unit="omarchy-time-machine-check@$name.timer"
+      maintenance_units+=("$unit")
+      write_unit "$unit" "$(maintenance_timer_unit "Weekly check of $name" "omarchy-time-machine-check@$name.service" "$check_schedule")"
+    fi
+    if [ -n "$data_schedule" ]; then
+      unit="omarchy-time-machine-check-data@$name.timer"
+      maintenance_units+=("$unit")
+      write_unit "$unit" "$(maintenance_timer_unit "Monthly data check of $name" "omarchy-time-machine-check-data@$name.service" "$data_schedule")"
+    fi
+    if [ -n "$restore_schedule" ]; then
+      unit="omarchy-time-machine-restore-test@$name.timer"
+      maintenance_units+=("$unit")
+      write_unit "$unit" "$(maintenance_timer_unit "Quarterly restore test of $name" "omarchy-time-machine-restore-test@$name.service" "$restore_schedule")"
+    fi
   done < <(cfg '.destinations[].name')
 
   # Timers for destinations that no longer exist, or that lost their schedule:
@@ -1748,6 +2096,15 @@ cmd_install() {
   local failures=0
   for name in "${names[@]}"; do
     unit="omarchy-time-machine@$name.timer"
+    if systemctl --user enable --now "$unit" >/dev/null 2>&1; then
+      printf '  enabled %s\n' "$unit"
+    else
+      printf '  could not enable %s\n' "$unit" >&2
+      failures=$((failures + 1))
+    fi
+  done
+
+  for unit in ${maintenance_units+"${maintenance_units[@]}"}; do
     if systemctl --user enable --now "$unit" >/dev/null 2>&1; then
       printf '  enabled %s\n' "$unit"
     else
@@ -1955,6 +2312,9 @@ omarchy-time-machine $VERSION
   ls --dest <name> --snapshot <id> --path </abs> --json
   restore --dest <name> --snapshot <id> --path </abs> [--target <dir>]
   check --dest <name>                 verify repository integrity
+        [--read-data-subset 5%]
+  verify-restore --dest <name>        restore configured samples elsewhere and compare
+  eject --dest <name> [--json]        unmount and power off a removable destination
   install                             (re)write and enable the systemd units
   config create                       write a starter configuration
   log [--dest <name>]                 path of the most recent log file
@@ -1977,8 +2337,11 @@ main() {
     ls) need restic; cmd_ls "$@" ;;
     restore) need restic; cmd_restore "$@" ;;
     check) need restic; cmd_check "$@" ;;
+    verify-restore) need restic; need diff; cmd_verify_restore "$@" ;;
+    eject) need findmnt; need lsblk; need udisksctl; cmd_eject "$@" ;;
     install) cmd_install "$@" ;;
     report-failure) cmd_report_failure "$@" ;;
+    report-maintenance-failure) cmd_report_maintenance_failure "$@" ;;
     log) cmd_log "$@" ;;
     config) cmd_config "$@" ;;
     demo) cmd_demo "$@" ;;

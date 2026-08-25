@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly check of the Omarchy system-state repository
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+Unit=omarchy-system-backup-check.service
+
+[Install]
+WantedBy=timers.target

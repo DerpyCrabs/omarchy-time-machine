@@ -24,7 +24,7 @@ Item {
 
   signal clicked()
 
-  readonly property bool hot: mouse.containsMouse || root.hasCursor
+  readonly property bool hot: root.enabled && (mouse.containsMouse || root.hasCursor)
 
   implicitHeight: Style.space(26)
   height: implicitHeight
@@ -46,7 +46,8 @@ Item {
     text: root.label
     textFormat: Text.PlainText
     elide: Text.ElideRight
-    color: root.destructive ? Color.urgent : root.foreground
+    color: !root.enabled ? Qt.darker(root.foreground, 1.8)
+                         : (root.destructive ? Color.urgent : root.foreground)
     font.family: root.fontFamily
     font.pixelSize: Style.font.body
   }
@@ -55,7 +56,8 @@ Item {
     id: mouse
     anchors.fill: parent
     hoverEnabled: true
-    cursorShape: Qt.PointingHandCursor
+    enabled: root.enabled
+    cursorShape: root.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
     onClicked: root.clicked()
   }
 }

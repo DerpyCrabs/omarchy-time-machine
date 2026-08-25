@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+CONFIG_FILE=/etc/omarchy-system-backup.conf
+STATE_DIR=/var/lib/omarchy-system-backup
+STATUS_FILE="$STATE_DIR/status.json"
+LOG_DIR="$STATE_DIR/logs"
+MANIFEST_DIR="$STATE_DIR/manifests"
+
+[ "$(id -u)" -eq 0 ] || { printf 'This command must run as root.\n' >&2; exit 1; }
+[ -r "$CONFIG_FILE" ] || { printf 'Missing %s\n' "$CONFIG_FILE" >&2; exit 1; }
+
+# The file is root-owned and mode 0600. It contains paths and UUIDs, not shell
+# supplied by an untrusted user.
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
+: "${RESTIC_PASSWORD_FILE:?RESTIC_PASSWORD_FILE is required}"
+: "${BACKUP_MOUNT:?BACKUP_MOUNT is required}"
+: "${BACKUP_UUID:?BACKUP_UUID is required}"
+: "${PARTITION_DEVICE:=/dev/nvme0n1}"
+
+install -d -o root -g root -m 0700 "$STATE_DIR" "$LOG_DIR" "$MANIFEST_DIR"
+
+mode="${1:-backup}"
+case "$mode" in
+  backup|check|check-data|restore-test) ;;
+  *) printf 'Usage: %s backup|check|check-data|restore-test\n' "$0" >&2; exit 2 ;;
+esac
+
+started_at="$(date -Iseconds)"
+started_epoch="$(date +%s)"
+log_file="$LOG_DIR/$(date +%Y%m%d-%H%M%S)-$mode.log"
+last_error=""
+restore_target=""
+
+exec > >(tee -a "$log_file") 2>&1
+
+write_status() {
+  local result="$1" error="${2:-}" finished_at finished_epoch duration previous tmp field
+  finished_at="$(date -Iseconds)"
+  finished_epoch="$(date +%s)"
+  duration=$((finished_epoch - started_epoch))
+  previous='{}'
+  [ -r "$STATUS_FILE" ] && previous="$(cat "$STATUS_FILE")"
+  field="last_$mode"
+  field="${field//-/_}"
+  tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"
+  jq -c \
+    --arg field "$field" \
+    --arg started "$started_at" \
+    --arg finished "$finished_at" \
+    --arg result "$result" \
+    --arg error "$error" \
+    --arg log "$log_file" \
+    --argjson duration "$duration" '
+      .version = 1
+      | .[$field] = {
+          started_at:$started, finished_at:$finished, result:$result,
+          duration_seconds:$duration,
+          error:(if $error == "" then null else $error end), log_file:$log
+        }
+      | if $field == "last_backup" then
+          .last_run = .[$field]
+          | if $result == "ok" then .last_success_at = $finished else . end
+        else . end
+    ' <<<"$previous" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$STATUS_FILE"
+}
+
+notify_failure() {
+  local detail="$1"
+  [ -S /run/user/1000/bus ] || return 0
+  runuser -u crab -- env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+    notify-send -u critical -t 0 -- "System backup failed" "$detail" >/dev/null 2>&1 || true
+}
+
+on_error() {
+  last_error="line $1: $2"
+}
+
+on_exit() {
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    write_status ok
+  else
+    [ -n "$last_error" ] || last_error="$mode exited with status $rc"
+    write_status failed "$last_error" || true
+    notify_failure "$last_error"
+  fi
+  if [ -n "$restore_target" ] && [[ "$restore_target" == /mnt/trash/backup-restore-tests/system-state.* ]]; then
+    rm -rf -- "$restore_target"
+  fi
+  find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -mtime +90 -delete 2>/dev/null || true
+  exit "$rc"
+}
+
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+trap on_exit EXIT
+
+# Trigger the automount, then verify the filesystem. This refuses to create a
+# repository on the OS disk when the backup SSD is absent.
+ls -d "$BACKUP_MOUNT/." >/dev/null
+findmnt -rn -S "UUID=$BACKUP_UUID" -T "$BACKUP_MOUNT" >/dev/null
+[ -r "$RESTIC_PASSWORD_FILE" ]
+
+export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+
+capture_manifests() {
+  pacman -Qqen > "$MANIFEST_DIR/pacman-explicit-native.txt"
+  pacman -Qqem > "$MANIFEST_DIR/pacman-explicit-foreign.txt"
+  pacman -Q > "$MANIFEST_DIR/pacman-all.txt"
+  systemctl list-unit-files --state=enabled --no-pager > "$MANIFEST_DIR/enabled-system-units.txt"
+  systemctl list-timers --all --no-pager > "$MANIFEST_DIR/system-timers.txt"
+  lsblk -f > "$MANIFEST_DIR/lsblk-filesystems.txt"
+  findmnt --real > "$MANIFEST_DIR/mounts.txt"
+  sfdisk --dump "$PARTITION_DEVICE" > "$MANIFEST_DIR/partition-table.txt"
+  omarchy version > "$MANIFEST_DIR/omarchy-version.txt" 2>&1 || true
+  dkms status > "$MANIFEST_DIR/dkms-status.txt" 2>&1 || true
+  efibootmgr -v > "$MANIFEST_DIR/efi-boot-entries.txt" 2>&1 || true
+  chmod 0600 "$MANIFEST_DIR"/*
+}
+
+case "$mode" in
+  backup)
+    capture_manifests
+    sources=(/etc /usr/local "$MANIFEST_DIR")
+    for optional in /var/lib/bluetooth /var/lib/NetworkManager /var/lib/cups; do
+      [ ! -e "$optional" ] || sources+=("$optional")
+    done
+    restic backup --json --exclude-caches --one-file-system --retry-lock 10m \
+      --tag system-state -- "${sources[@]}"
+    restic forget --keep-daily 14 --keep-weekly 8 --keep-monthly 12 \
+      --keep-yearly 3 --prune
+    ;;
+  check)
+    restic check
+    ;;
+  check-data)
+    restic check --read-data-subset=5%
+    ;;
+  restore-test)
+    : "${RESTORE_TEST_ROOT:?RESTORE_TEST_ROOT is required}"
+    : "${RESTORE_TEST_MOUNT:?RESTORE_TEST_MOUNT is required}"
+    : "${RESTORE_TEST_UUID:?RESTORE_TEST_UUID is required}"
+    ls -d "$RESTORE_TEST_MOUNT/." >/dev/null
+    findmnt -rn -S "UUID=$RESTORE_TEST_UUID" -T "$RESTORE_TEST_MOUNT" >/dev/null
+    snapshot="$(restic snapshots --latest 1 --json | jq -r '.[0].id // empty')"
+    [ -n "$snapshot" ]
+    install -d -o root -g root -m 0700 "$RESTORE_TEST_ROOT"
+    restore_target="$(mktemp -d "$RESTORE_TEST_ROOT/system-state.XXXXXX")"
+    sample="$MANIFEST_DIR/pacman-explicit-native.txt"
+    [ -f "$sample" ]
+    restic restore --target "$restore_target" --include "$sample" -- "$snapshot"
+    cmp -- "$sample" "$restore_target$sample"
+    ;;
+esac

@@ -1,0 +1,8 @@
+RESTIC_REPOSITORY=/mnt/backups/system-state
+RESTIC_PASSWORD_FILE=/etc/omarchy-system-backup.key
+BACKUP_MOUNT=/mnt/backups
+BACKUP_UUID=17b0c1c6-0c8d-464b-92d7-5dd3535e8db3
+PARTITION_DEVICE=/dev/nvme0n1
+RESTORE_TEST_ROOT=/mnt/trash/backup-restore-tests
+RESTORE_TEST_MOUNT=/mnt/trash
+RESTORE_TEST_UUID=C854AC6154AC53CA

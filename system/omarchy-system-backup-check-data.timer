@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly data check of the Omarchy system-state repository
+
+[Timer]
+OnCalendar=*-*-01 04:30:00
+Persistent=true
+Unit=omarchy-system-backup-check-data.service
+
+[Install]
+WantedBy=timers.target

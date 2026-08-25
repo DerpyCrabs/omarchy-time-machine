@@ -1,0 +1,11 @@
+[Unit]
+Description=Read a sample of the Omarchy system-state repository
+After=local-fs.target
+RequiresMountsFor=/mnt/backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/omarchy-system-backup check-data
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle

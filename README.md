@@ -113,6 +113,63 @@ You only need `name` and `repository`. Everything else already has a sensible de
 | `pre_command` | none | A command to wake the destination first. See below. |
 | `on_failure_command` | none | A command to run when a backup fails, if a red icon isn't enough. |
 
+### Refuse the wrong disk
+
+For local repositories, identify every required filesystem by mount path and
+UUID. A backup then stops before restic starts if a disk is absent or a plain
+directory is sitting where the mount should be:
+
+```json
+{
+  "required_mounts": [
+    { "path": "/mnt/data", "uuid": "DATA-FILESYSTEM-UUID" },
+    { "path": "/mnt/backups", "uuid": "BACKUP-FILESYSTEM-UUID" }
+  ]
+}
+```
+
+Put `required_mounts` on each destination. An internal systemd automount is
+woken when needed. A removable destination stays offline until you connect it.
+
+To make a removable destination show an eject action in the panel, add:
+
+```json
+{
+  "eject": {
+    "path": "/mnt/offline-backup",
+    "uuid": "OFFLINE-FILESYSTEM-UUID"
+  }
+}
+```
+
+The panel can start and stop each destination separately. Eject refuses while
+that destination is running, flushes writes, verifies the mounted UUID,
+unmounts the partition, and asks UDisks to power off the enclosure.
+
+### Show a privileged system backup
+
+The regular plugin runs as your desktop user and cannot read root-only VPN,
+NetworkManager, printer, or service configuration. This fork includes a
+separate example under `system/` for that data. The widget only reads its
+non-secret status file:
+
+```json
+{
+  "system_jobs": [
+    {
+      "name": "system-state",
+      "display_name": "System state",
+      "service": "omarchy-system-backup.service",
+      "status_file": "/var/lib/omarchy-system-backup/status.json"
+    }
+  ]
+}
+```
+
+The root job uses its own repository and key file. Do not point root and user
+jobs at the same local repository unless its Unix group permissions were
+deliberately configured for both.
+
 Run `omarchy-time-machine install` again after changing a schedule.
 
 Times show on a 24-hour clock, to match the Omarchy clock next to it. If you'd rather have AM and PM, that's a setting on the widget in `shell.json`:

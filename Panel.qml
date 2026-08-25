@@ -31,6 +31,9 @@ Panel {
   // KeyboardPanel and simply swaps the content, because a second window would
   // lose keyboard focus on Wayland the moment the first one closed.
   property bool browsing: false
+  // Empty means the global action targets every running user backup. A name
+  // means the confirmation came from that destination's own row.
+  property string pendingStopName: ""
 
   readonly property color barIconColor: {
     if (TimeMachineStore.running) return accent
@@ -199,7 +202,8 @@ Panel {
 
       onActivateRequested: {
         if (stopConfirm.opened) {
-          TimeMachineStore.stopBackup()
+          if (root.pendingStopName === "") TimeMachineStore.stopAllBackups()
+          else TimeMachineStore.stopOne(root.pendingStopName)
           stopConfirm.opened = false
         } else if (root.browsing && browser.confirmOpen) {
           browser.confirmAccept()
@@ -327,6 +331,106 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
+
+                MenuRow {
+                  width: parent.width
+                  visible: TimeMachineStore.unitsInstalled
+                  enabled: modelData.running || modelData.repository_available !== false
+                  label: {
+                    var name = TimeMachineStore.destinationLabel(modelData)
+                    if (modelData.running) return "Stop " + name
+                    if (modelData.repository_available === false)
+                      return modelData.removable ? "Connect " + name : name + " is unavailable"
+                    return "Back up " + name + " now"
+                  }
+                  destructive: modelData.running
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    if (modelData.running) {
+                      root.pendingStopName = String(modelData.name)
+                      stopConfirm.opened = true
+                    } else {
+                      TimeMachineStore.startOne(String(modelData.name))
+                    }
+                  }
+                }
+
+                MenuRow {
+                  width: parent.width
+                  visible: modelData.removable === true
+                           && modelData.repository_available === true
+                           && !modelData.running
+                  label: "Eject " + TimeMachineStore.destinationLabel(modelData) + " safely"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: TimeMachineStore.ejectOne(String(modelData.name))
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            visible: TimeMachineStore.systemJobs.length > 0
+            spacing: Style.space(6)
+            bottomPadding: visible ? Style.space(8) : 0
+
+            Text {
+              width: parent.width
+              text: "System backups"
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Repeater {
+              model: TimeMachineStore.systemJobs
+
+              Column {
+                width: parent.width
+                spacing: Style.space(1)
+
+                Item {
+                  width: parent.width
+                  height: Style.space(18)
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.right: systemStateText.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: TimeMachineStore.destinationLabel(modelData)
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Text {
+                    id: systemStateText
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: TimeMachineStore.destinationState(modelData)
+                    textFormat: Text.PlainText
+                    color: TimeMachineStore.destinationFailed(modelData) ? root.urgent : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  visible: text !== ""
+                  text: TimeMachineStore.destinationDetail(modelData)
+                  textFormat: Text.PlainText
+                  elide: Text.ElideRight
+                  color: root.dimmer
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
               }
             }
           }
@@ -378,14 +482,17 @@ Panel {
           MenuRow {
             width: parent.width
             visible: TimeMachineStore.configured && TimeMachineStore.unitsInstalled
-            label: TimeMachineStore.anyRunning ? "Stop This Backup" : "Back Up Now"
-            destructive: TimeMachineStore.anyRunning
+            label: TimeMachineStore.userBackupsRunning ? "Stop Running Backups" : "Back Up Now"
+            destructive: TimeMachineStore.userBackupsRunning
             foreground: root.foreground
             fontFamily: root.fontFamily
             onClicked: {
-              if (TimeMachineStore.anyRunning) stopConfirm.opened = true
-              else if (TimeMachineStore.multiple) TimeMachineStore.startAllBackups()
-              else TimeMachineStore.startBackup()
+              if (TimeMachineStore.userBackupsRunning) {
+                root.pendingStopName = ""
+                stopConfirm.opened = true
+              } else {
+                TimeMachineStore.startAllBackups()
+              }
             }
           }
 
@@ -464,7 +571,8 @@ Panel {
       cancelText: "Keep running"
       fontFamily: root.fontFamily
       onConfirmed: {
-        TimeMachineStore.stopBackup()
+        if (root.pendingStopName === "") TimeMachineStore.stopAllBackups()
+        else TimeMachineStore.stopOne(root.pendingStopName)
         stopConfirm.opened = false
       }
       onCanceled: stopConfirm.opened = false

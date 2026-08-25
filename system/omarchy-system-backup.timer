@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Omarchy system-state backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+Unit=omarchy-system-backup.service
+
+[Install]
+WantedBy=timers.target

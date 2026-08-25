@@ -1,0 +1,11 @@
+[Unit]
+Description=Test restore from the Omarchy system-state repository
+After=local-fs.target
+RequiresMountsFor=/mnt/backups /mnt/trash
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/omarchy-system-backup restore-test
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle

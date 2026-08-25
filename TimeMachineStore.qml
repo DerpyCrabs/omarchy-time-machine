@@ -53,6 +53,7 @@ Singleton {
   property bool configInvalid: false
   property string configError: ""
   property var destinations: []
+  property var systemJobs: []
   // The first destination, used where something has to pick one on its own.
   // There is no "active" destination any more: with several of them they all
   // run on their own schedule and they all matter.
@@ -63,9 +64,9 @@ Singleton {
   readonly property var lastRun: active && active.last_run ? active.last_run : null
   readonly property string lastSuccessAt: active && active.last_success_at
                                           ? String(active.last_success_at) : ""
-  readonly property bool running: active ? active.running === true : false
+  readonly property bool running: anyRunning
   readonly property var progress: active && active.progress ? active.progress : null
-  readonly property bool failed: lastRun ? lastRun.result === "failed" : false
+  readonly property bool failed: anyFailed
   readonly property bool everRan: lastRun !== null
 
   // Ticks once a minute so "3 hours ago" ages without a status call. Bumping
@@ -106,6 +107,7 @@ Singleton {
     root.configInvalid = payload.invalid === true
     root.configError = payload.error ? String(payload.error) : ""
     root.destinations = payload.destinations || []
+    root.systemJobs = payload.system_jobs || []
 
     root.loaded = true
   }
@@ -133,7 +135,9 @@ Singleton {
   // button start the same unit instance, so systemd serialises them without
   // any locking of our own.
   Process { id: startProc }
+  Process { id: startAllProc }
   Process { id: stopProc }
+  Process { id: ejectProc; stdout: StdioCollector { onStreamFinished: root.refresh() } }
   Process { id: useProc; stdout: StdioCollector { onStreamFinished: root.refresh() } }
 
   readonly property bool multiple: destinations.length > 1
@@ -142,11 +146,15 @@ Singleton {
   // to a user with three of them: they all matter, and the nightly timers run
   // them all anyway, so the button does what the schedule does.
   function startAllBackups() {
+    var command = ["systemctl", "--user", "start", "--no-block"]
     for (var i = 0; i < destinations.length; i++) {
       var d = destinations[i]
-      if (d.running) continue
-      startOne(String(d.name))
+      if (d.running || d.repository_available === false) continue
+      command.push("omarchy-time-machine@" + String(d.name) + ".service")
     }
+    if (command.length === 4) return
+    startAllProc.command = command
+    startAllProc.running = true
     kickPoll.restart()
   }
 
@@ -156,9 +164,16 @@ Singleton {
     startProc.running = true
   }
 
-  readonly property bool anyRunning: {
+  readonly property bool userBackupsRunning: {
     for (var i = 0; i < destinations.length; i++)
       if (destinations[i].running) return true
+    return false
+  }
+
+  readonly property bool anyRunning: {
+    if (userBackupsRunning) return true
+    for (var j = 0; j < systemJobs.length; j++)
+      if (systemJobs[j].running) return true
     return false
   }
 
@@ -166,6 +181,10 @@ Singleton {
     for (var i = 0; i < destinations.length; i++) {
       var run = destinations[i].last_run
       if (run && run.result === "failed") return true
+    }
+    for (var j = 0; j < systemJobs.length; j++) {
+      var systemRun = systemJobs[j].last_run
+      if (systemRun && systemRun.result === "failed") return true
     }
     return false
   }
@@ -225,6 +244,7 @@ Singleton {
         return Math.round(Number(p.percent) * 100) + "%"
       return "Working\u2026"
     }
+    if (d.repository_available === false) return "Offline"
     if (!d.last_run) return "Never"
     if (d.last_run.result === "failed")
       return "Failed " + menuDate(d.last_run.finished_at)
@@ -249,6 +269,9 @@ Singleton {
       if (!p || !p.total_bytes) return phrase + "\u2026"
       return phrase + "\u2026 " + humanBytes(p.bytes_done) + " of " + humanBytes(p.total_bytes)
     }
+
+    if (d.repository_available === false)
+      return d.removable ? "Connect the configured drive" : "Required disk is not mounted"
 
     if (destinationFailed(d)) {
       if (d.last_success_at)
@@ -282,9 +305,31 @@ Singleton {
 
   function stopBackup() {
     if (!active) return
+    stopOne(String(active.name))
+  }
+
+  function stopOne(name) {
     stopProc.command = ["systemctl", "--user", "stop",
-                        "omarchy-time-machine@" + active.name + ".service"]
+                        "omarchy-time-machine@" + name + ".service"]
     stopProc.running = true
+    kickPoll.restart()
+  }
+
+  function stopAllBackups() {
+    var command = ["systemctl", "--user", "stop"]
+    for (var i = 0; i < destinations.length; i++) {
+      if (destinations[i].running)
+        command.push("omarchy-time-machine@" + String(destinations[i].name) + ".service")
+    }
+    if (command.length === 3) return
+    stopProc.command = command
+    stopProc.running = true
+    kickPoll.restart()
+  }
+
+  function ejectOne(name) {
+    ejectProc.command = [root.cli, "eject", "--dest", name, "--json"]
+    ejectProc.running = true
     kickPoll.restart()
   }
 
