@@ -484,6 +484,10 @@ check $? "a destination can be stopped by name"
 grep -q 'TimeMachineStore.startOne(String(modelData.name))' "$PANEL"
 check $? "the panel exposes a per-destination backup action"
 
+grep -q 'modelData.removable === true' "$PANEL" \
+  && grep -q 'Mount and back up' "$PANEL"
+check $? "an offline removable destination can trigger its guarded automount"
+
 cp "$WORK/config.before-mounts" "$CONFIG"
 
 # --- status-only system jobs ----------------------------------------------

@@ -335,12 +335,18 @@ Panel {
                 MenuRow {
                   width: parent.width
                   visible: TimeMachineStore.unitsInstalled
-                  enabled: modelData.running || modelData.repository_available !== false
+                  // A removable filesystem may be connected but not mounted.
+                  // Starting its guarded unit enters the configured mount path,
+                  // which triggers the UUID-bound systemd automount. If the disk
+                  // is absent, the mount guard fails before restic can write.
+                  enabled: modelData.running
+                           || modelData.repository_available !== false
+                           || modelData.removable === true
                   label: {
                     var name = TimeMachineStore.destinationLabel(modelData)
                     if (modelData.running) return "Stop " + name
                     if (modelData.repository_available === false)
-                      return modelData.removable ? "Connect " + name : name + " is unavailable"
+                      return modelData.removable ? "Mount and back up " + name : name + " is unavailable"
                     return "Back up " + name + " now"
                   }
                   destructive: modelData.running
