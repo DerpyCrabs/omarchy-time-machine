@@ -93,6 +93,7 @@ SUMMARY_FILE=""
 ERROR_FILE=""
 UNREADABLE_FILE=""
 RESTORE_TEST_TARGET=""
+RESTORE_TEST_PARENT=""
 
 # die() must only ever be called from the main shell, never from inside a
 # command substitution: there it would exit the subshell and the caller would
@@ -1125,15 +1126,20 @@ cmd_verify_restore() {
 
   snapshot="$(restic_run snapshots --latest 1 --json | jq -r '.[0].id // empty')"
   [ -n "$snapshot" ] || die "repository has no snapshot to restore"
-  install -d -m 0700 "$root"
-  target="$(mktemp -d "$root/user-data.XXXXXX")"
+  install -d -m 0700 "$root" ||
+    die "could not create restore-test root: $root"
+  target="$(mktemp -d "$root/user-data.XXXXXX")" ||
+    die "could not create a temporary restore-test directory under $root"
+  [ -n "$target" ] ||
+    die "could not create a temporary restore-test directory under $root"
+  RESTORE_TEST_PARENT="$root"
   RESTORE_TEST_TARGET="$target"
-  trap 'rm -rf -- "${RESTORE_TEST_TARGET:?}"' EXIT
+  trap 'if [[ -n "$RESTORE_TEST_PARENT" && -n "$RESTORE_TEST_TARGET" && "$RESTORE_TEST_TARGET" == "$RESTORE_TEST_PARENT"/user-data.* ]]; then rm -rf -- "$RESTORE_TEST_TARGET"; fi' EXIT
 
   local -a restore_args=(restore --target "$target")
   for entry in "${includes[@]}"; do restore_args+=(--include "$entry"); done
   restore_args+=(-- "$snapshot")
-  restic_run "${restore_args[@]}"
+  restic_run "${restore_args[@]}" || die "restore test failed"
 
   for entry in "${includes[@]}"; do
     diff -qr --no-dereference -- "$entry" "$target$entry" >/dev/null ||

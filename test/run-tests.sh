@@ -38,6 +38,7 @@ group(){ printf '\n\033[1m%s\033[0m\n' "$1"; }
 # --- fixture ---------------------------------------------------------------
 
 mkdir -p "$XDG_CONFIG_HOME/omarchy-time-machine" "$WORK/repo" "$WORK/src/docs" "$WORK/src/pics"
+CONFIG="$XDG_CONFIG_HOME/omarchy-time-machine/config.json"
 echo "hello" > "$WORK/src/docs/note.txt"
 echo "report" > "$WORK/src/docs/report.md"
 head -c 200000 /dev/urandom > "$WORK/src/pics/photo.bin"
@@ -172,6 +173,35 @@ $CLI restore --dest test --snapshot "$SNAP" --path "$WORK/src/docs/report.md" --
 [ "$(cat "$WORK/restored$WORK/src/docs/report.md" 2>/dev/null)" = "report" ]
 check $? "restore writes the file into the target directory"
 
+# --- verified restore failures --------------------------------------------
+
+group "Verified restore"
+
+MOUNT_UUID="$(findmnt -rn -T / -o UUID | head -1)"
+cp "$CONFIG" "$WORK/config.before-restore-test"
+jq --arg root "$WORK/restore-tests" --arg uuid "$MOUNT_UUID" --arg sample "$WORK/src/docs/note.txt" '
+  .restore_test = {
+    root: $root,
+    mount: {path: "/", uuid: $uuid},
+    paths: [$sample]
+  }
+' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+
+OUT="$($CLI verify-restore --dest test 2>&1)"
+[ $? -eq 0 ] && grep -q '^Verified 1 item' <<<"$OUT"
+check $? "a restored sample is compared before success is reported"
+
+mkdir -p "$WORK/locked"
+chmod 0500 "$WORK/locked"
+jq --arg root "$WORK/locked/child" '.restore_test.root = $root' \
+  "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+OUT="$($CLI verify-restore --dest test 2>&1)"
+[ $? -ne 0 ] && grep -q 'could not create restore-test root' <<<"$OUT" \
+  && ! grep -q '^Verified' <<<"$OUT"
+check $? "an unwritable restore root fails instead of claiming verification"
+chmod 0700 "$WORK/locked"
+cp "$WORK/config.before-restore-test" "$CONFIG"
+
 # --- large listings --------------------------------------------------------
 #
 # restic decides how much output a listing produces, and until it is capped at
@@ -243,7 +273,6 @@ check $? "restore refuses an invalid id (die inside \$( ) would only kill a subs
 
 group "stdout discipline"
 
-CONFIG="$XDG_CONFIG_HOME/omarchy-time-machine/config.json"
 cp "$CONFIG" "$WORK/config.bak"
 jq '.destinations[0].pre_command = "echo noise from pre_command"' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
 
