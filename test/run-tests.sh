@@ -106,6 +106,59 @@ check $? "snapshot count and repository size are recorded"
 [ "$($CLI snapshots --dest test --json | jq -r '.snapshots[0].summary.total_files_processed')" = "3" ]
 check $? "the exclude file is honoured (.env stayed out)"
 
+# --- unreadable source files -----------------------------------------------
+#
+# restic exits 3 when it could not read something, and still writes a snapshot
+# -- one with a hole where that file was. Treating that as success is what lets
+# a backup rot in silence: the last snapshot that still held the file ages out
+# of the retention policy, prune reclaims its data, and nothing ever went red.
+
+group "Unreadable source files"
+
+GOOD_SUCCESS="$(jq -r '.destinations.test.last_success_at' "$STATUS")"
+LOGS="$XDG_STATE_HOME/omarchy-time-machine/logs/test"
+
+chmod 000 "$WORK/src/docs/report.md"
+$CLI backup --dest test >/dev/null 2>&1
+[ $? -eq 1 ]
+check $? "an unreadable file fails the run, and reports it as a plain failure"
+
+# restic's own 3 must not reach systemd. A unit is a copy in the user's home
+# that no plugin update can rewrite, so the moment the exit code needs
+# interpreting there, the interpretation is stranded in a file this project
+# cannot revise. Exit 1 needs no interpreting, which is what lets a stale unit
+# carrying SuccessExitStatus=3 still do the right thing.
+$CLI backup --dest test >/dev/null 2>&1
+[ $? -ne 3 ]
+check $? "and restic's exit 3 never leaks out of the CLI"
+
+jq -e '.destinations.test.last_run.result == "failed"' "$STATUS" >/dev/null 2>&1
+check $? "and that counts as a failure, not as a success with a footnote"
+
+jq -e --arg p "$WORK/src/docs/report.md" \
+  '.destinations.test.last_run.error | test($p)' "$STATUS" >/dev/null 2>&1
+check $? "the reason names the file that could not be read"
+
+[ "$(jq -r '.destinations.test.last_success_at' "$STATUS")" = "$GOOD_SUCCESS" ]
+check $? "last_success_at still points at the last run that read everything"
+
+LAST_LOG="$(find "$LOGS" -name '*.log' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+grep -q "Removing old snapshots" "$LAST_LOG"
+[ $? -ne 0 ]
+check $? "and nothing was pruned, so the older snapshots still hold the file"
+
+grep -q "message_type" "$LAST_LOG"
+[ $? -ne 0 ]
+check $? "restic's stderr reaches the log as prose, not as raw JSON"
+
+chmod 644 "$WORK/src/docs/report.md"
+$CLI backup --dest test >/dev/null 2>&1
+check $? "a clean run afterwards succeeds again"
+
+LAST_LOG="$(find "$LOGS" -name '*.log' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+grep -q "Removing old snapshots" "$LAST_LOG"
+check $? "and prune resumes, clearing the backlog the failures left behind"
+
 # --- reading the repository ------------------------------------------------
 
 group "Reading"
@@ -258,8 +311,14 @@ for unit in "omarchy-time-machine@.service" "omarchy-time-machine-failed@.servic
   check $? "install writes $unit"
 done
 
-grep -q "SuccessExitStatus=3" "$XDG_CONFIG_HOME/systemd/user/omarchy-time-machine@.service"
-check $? "the service treats restic exit 3 as success, not as a nightly failure"
+# restic exits 3 when it could not read a source file. The snapshot it writes
+# then has holes in it, and calling that a success is how a backup rots
+# unnoticed: the last snapshot that still held the file ages out, prune
+# reclaims its data, and the icon stayed green throughout. So the unit must
+# NOT excuse it -- OnFailure has to fire.
+grep -q "SuccessExitStatus" "$XDG_CONFIG_HOME/systemd/user/omarchy-time-machine@.service"
+[ $? -ne 0 ]
+check $? "the service does not excuse restic exit 3"
 
 # install exits non-zero here because systemd cannot enable a unit under a
 # redirected XDG_CONFIG_HOME. What is under test is that it rewrites nothing.

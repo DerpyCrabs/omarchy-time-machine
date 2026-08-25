@@ -81,6 +81,7 @@ icon_for() {
 JSON_MODE=0
 SUMMARY_FILE=""
 ERROR_FILE=""
+UNREADABLE_FILE=""
 
 # die() must only ever be called from the main shell, never from inside a
 # command substitution: there it would exit the subshell and the caller would
@@ -1040,8 +1041,9 @@ cmd_backup() {
   # every single run.
   SUMMARY_FILE="$(mktemp -- "$STATE_DIR/.summary.XXXXXX")" || die "could not create a temporary file"
   ERROR_FILE="$SUMMARY_FILE.reason"
+  UNREADABLE_FILE="$SUMMARY_FILE.unreadable"
   chmod 600 -- "$SUMMARY_FILE"
-  trap 'rm -f -- "${SUMMARY_FILE:-}" "${ERROR_FILE:-}"' EXIT
+  trap 'rm -f -- "${SUMMARY_FILE:-}" "${ERROR_FILE:-}" "${UNREADABLE_FILE:-}"' EXIT
 
   restic_context
 
@@ -1106,7 +1108,11 @@ cmd_backup() {
   progress_write running backup 1
 
   local backup_exit summary result
-  restic_run "${backup_args[@]}" 2>>"$LOG_FILE" | stream_backup "$SUMMARY_FILE" "$ERROR_FILE"
+  # restic --json puts its per-file "error" lines and its closing "exit_error"
+  # on stderr, not on stdout. Folding stderr into the pipe is the only way
+  # stream_backup gets to see them: appended straight to the log they would sit
+  # there as raw JSON, and nothing would know which files had been skipped.
+  restic_run "${backup_args[@]}" 2>&1 | stream_backup "$SUMMARY_FILE" "$ERROR_FILE" "$UNREADABLE_FILE"
   backup_exit="${PIPESTATUS[0]}"
   backup_exit="$(number_or "$backup_exit" 1)"
 
@@ -1122,9 +1128,30 @@ cmd_backup() {
     log_line "$(jq -r '"Snapshot: \(.snapshot_id // "(none — nothing changed)")"' <<<"$summary" 2>/dev/null)"
   fi
 
+  local reason=""
   case "$backup_exit" in
     0) log_line "Backup finished successfully"; result=ok ;;
-    3) log_line "Backup finished, some files could not be read"; result=warnings ;;
+    3)
+      # restic does write a snapshot here, but one with holes in it. Counting
+      # that as a success is how a backup quietly rots: the last snapshot that
+      # still held the unreadable file ages out of the retention policy, prune
+      # reclaims its data, and the only trace was a green icon. So it counts as
+      # a failure. That also skips forget/prune below and leaves
+      # last_success_at pointing at the last run that really did read
+      # everything, which is what the panel promises when it says "last good
+      # backup".
+      #
+      # The price is a repository that grows until the cause is fixed. That is
+      # the cheaper half of the trade: unpruned data is still your data, and
+      # the next clean run clears the backlog.
+      reason="$(unreadable_reason)"
+      [ -n "$reason" ] || reason="some files could not be read"
+      log_line "Backup failed: $reason"
+      # Beats restic's own "at least one source file could not be read", which
+      # is what exit_error already wrote here and which names nothing.
+      printf '%s' "$reason" > "$ERROR_FILE"
+      result=failed
+      ;;
     *) log_line "Backup failed (exit code $backup_exit)"; result=failed ;;
   esac
 
@@ -1142,7 +1169,16 @@ cmd_backup() {
   log_line ""
   log_line "Finished: $(date)"
 
-  return "$backup_exit"
+  # The exit code answers "did the backup work", not "which restic internal
+  # produced that answer". Passing restic's 3 straight through is what forced
+  # SuccessExitStatus=3 into the service unit, and a unit is a copy in
+  # ~/.config/systemd/user that no plugin update can reach -- so a policy
+  # decision ended up stranded in the one file this project cannot revise.
+  # Deciding it here instead means the units never need to change for it, and
+  # the stale ones already out there start behaving correctly the moment this
+  # script is updated: they excuse exit 3, and exit 3 no longer happens.
+  [ "$result" = "failed" ] && return 1
+  return 0
 }
 
 # Reads restic's --json stream: turns status lines into the progress file,
@@ -1152,7 +1188,8 @@ cmd_backup() {
 stream_backup() {
   local summary_file="$1"
   local error_file="$2"
-  local line type extra message
+  local unreadable_file="$3"
+  local line type extra message item
   while IFS= read -r line; do
     type="$(jq -r 'if type == "object" then (.message_type // "") else "" end' <<<"$line" 2>/dev/null)"
     case "$type" in
@@ -1172,19 +1209,26 @@ stream_backup() {
         printf '%s' "$line" > "$summary_file"
         ;;
       error)
-        log_line "restic: $(jq -r '.error.message // "unknown error"' <<<"$line" 2>/dev/null)"
+        # One line per file restic could not read. They are the whole reason a
+        # run ends in exit 3, so they are kept rather than only logged: the
+        # caller counts them and names the first one in the notification.
+        message="$(jq -r '.error.message // "unknown error"' <<<"$line" 2>/dev/null)"
+        item="$(jq -r '.item // ""' <<<"$line" 2>/dev/null)"
+        log_line "restic: $message"
+        printf '%s\n' "${item:-$message}" >> "$unreadable_file"
         ;;
       exit_error)
-        # With --json, restic reports a fatal error as a line on stdout rather
-        # than as text on stderr. Without this case it would land in the log as
-        # raw JSON, and the panel would have nothing to say beyond an exit
-        # code.
+        # restic closes a failed --json run with this line on stderr. It only
+        # arrives here because the caller folds stderr into the pipe; left to
+        # itself it would land in the log as raw JSON, and the panel would have
+        # nothing to say beyond an exit code.
         message="$(jq -r '.message // ""' <<<"$line" 2>/dev/null)"
         [ -n "$message" ] || message="restic exited with an error"
         log_line "$message"
         # Only the first line: the rest is restic suggesting where to look,
         # which is useful in a log and too long for a notification.
-        printf '%s' "$(printf '%s' "$message" | head -1)" > "$error_file"
+        printf '%s' "$(strip_error_prefix "$(printf '%s' "$message" | head -1)")" \
+          > "$error_file"
         ;;
       *)
         [ -n "$(trim "$line")" ] && log_line "$line"
@@ -1192,6 +1236,22 @@ stream_backup() {
     esac
   done
   return 0
+}
+
+# How many files restic skipped, and the first of them. The notification has
+# to say something you can act on, and a path is that; a count on its own only
+# tells you to go and open the log.
+unreadable_reason() {
+  local count first
+  readable_file "$UNREADABLE_FILE" || return 0
+  count="$(number_or "$(grep -c '' -- "$UNREADABLE_FILE" 2>/dev/null)" 0)"
+  [ "$count" -gt 0 ] || return 0
+  first="$(head -1 -- "$UNREADABLE_FILE" 2>/dev/null)"
+  if [ "$count" = "1" ]; then
+    printf 'could not read %s' "$first"
+  else
+    printf 'could not read %s and %d more' "$first" "$((count - 1))"
+  fi
 }
 
 run_forget() {
@@ -1208,6 +1268,18 @@ run_forget() {
   return 0
 }
 
+# restic shouts "Fatal:" and this script shouts "Error:". The notification it
+# goes under already says the backup failed, so the prefix only costs room for
+# the actual reason. Shared, because the message reaches the status file by two
+# routes: caught while streaming, or dug out of the log afterwards.
+strip_error_prefix() {
+  local line="$1"
+  line="${line#Fatal: }"
+  line="${line#Error: }"
+  line="${line#error: }"
+  printf '%s' "$line"
+}
+
 # The line worth showing a human out of a failed run. restic says the useful
 # thing on a line starting with "Fatal:", and this script's own errors start
 # with "Error:". Everything else in the log is progress noise, so fall back to
@@ -1216,9 +1288,9 @@ last_error_line() {
   local logfile="$1" line=""
   readable_file "$logfile" || return 0
 
-  # restic --json reports a fatal error as JSON on *stderr*, which lands in the
-  # log verbatim rather than travelling through the stdout pipe. So the message
-  # has to be dug out of the log rather than caught while streaming.
+  # Logs written before stderr was folded into the pipe carry the raw JSON
+  # line rather than the message stream_backup now writes. Kept so that
+  # report-failure can still explain a run from one of those.
   line="$(grep -F '"message_type":"exit_error"' -- "$logfile" 2>/dev/null | tail -1)"
   if [ -n "$line" ]; then
     line="$(jq -r '.message // ""' <<<"$line" 2>/dev/null | head -1)"
@@ -1230,11 +1302,7 @@ last_error_line() {
   [ -n "$line" ] || line="$(grep -E '^(Fatal|Error|error):' -- "$logfile" 2>/dev/null | tail -1)"
   [ -n "$line" ] || line="$(grep -v '^[[:space:]]*$' -- "$logfile" 2>/dev/null | tail -1)"
 
-  # Drop restic's "Fatal:" shout. The notification it goes under already says
-  # the backup failed; saying it twice just costs room for the actual reason.
-  line="${line#Fatal: }"
-  line="${line#Error: }"
-  line="${line#error: }"
+  line="$(strip_error_prefix "$line")"
 
   # Long enough to say what broke, short enough to stay a notification.
   printf '%s' "${line:0:180}"
@@ -1556,11 +1624,6 @@ OnFailure=omarchy-time-machine-failed@%i.service
 Type=oneshot
 Environment=PATH=$(unit_path_env)
 ExecStart=$SELF backup --dest %i
-
-# restic exits 3 when files were unreadable or vanished during the run. On a
-# live system that is normal, not a failure -- without this line systemd would
-# fire the OnFailure unit almost every night.
-SuccessExitStatus=3
 
 # The first run takes hours, later ones minutes. Leave room, so a slow night is
 # not cut off halfway.
