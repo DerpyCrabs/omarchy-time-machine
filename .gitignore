@@ -1,3 +1,4 @@
 # Nothing generated lives here, but editors and file managers disagree.
 *.swp
 .DS_Store
+.gstack/

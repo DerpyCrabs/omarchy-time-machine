@@ -49,7 +49,9 @@ An external drive is the easy case. It also does a NAS over SSH, or a bucket in 
 { "name": "offsite", "repository": "s3:s3.amazonaws.com/my-bucket" }
 ```
 
-List more than one and the panel lists them all, each with its own schedule and its own history. A drive in your bag and a bucket in the cloud is a good pair: one is fast, the other survives your house.
+List more than one and the panel lists them all, each with its own schedule and its own history.
+
+Anywhere restic can write works: a local disk, SFTP, a REST server, S3, Minio, Wasabi, Backblaze B2, Azure Blob, Google Cloud Storage, Alibaba OSS, OpenStack Swift, or anything rclone can reach. A drive in your bag and a bucket in the cloud is a good pair: one is fast, the other survives your house.
 
 ## Pick a password
 
@@ -103,7 +105,7 @@ You only need `name` and `repository`. Everything else already has a sensible de
 
 | Setting | Default | What it's for |
 |---|---|---|
-| `source` | your home folder | What gets backed up. |
+| `source` | your home folder | What gets backed up. A path, or a list of them: `["~", "/etc", "/srv/data"]`. If one is missing the backup stops rather than quietly taking half of it. |
 | `exclude_file` | `excludes.txt` next to your config | Things to skip. Caches, downloads, virtual machine images. Anything you can get back another way. |
 | `retention` | 7 daily, 4 weekly, 12 monthly, 3 yearly | How far back you can go. Older backups get thinned out rather than kept forever. |
 | `schedule` | none | When it runs. `"*-*-* 03:00:00"` is every night at three. Leave it out and this destination only runs when you press the button. |

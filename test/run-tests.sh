@@ -388,6 +388,31 @@ check $? "a 1Password that will not answer fails fast instead of hanging"
 
 cp "$WORK/config.bak" "$CONFIG"
 
+# --- more than one source ---------------------------------------------------
+
+group "Multiple sources"
+
+mkdir -p "$WORK/extra"
+echo "elsewhere" > "$WORK/extra/note.txt"
+jq --arg a "$WORK/src" --arg b "$WORK/extra" '.source = [$a, $b]' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+
+$CLI backup --dest test >/dev/null 2>&1
+[ "$($CLI snapshots --dest test --json | jq -r '.snapshots[0].paths | length')" = "2" ]
+check $? "a list of sources ends up in one snapshot"
+
+# Stop rather than quietly snapshot what is left. A source that vanished is
+# usually an unmounted disk, and retention would happily thin out the good
+# snapshots to keep the incomplete ones.
+jq --arg m "$WORK/not-mounted" '.source += [$m]' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+OUT="$($CLI backup --dest test 2>&1)"
+grep -q "source does not exist" <<<"$OUT"
+check $? "a missing source stops the run instead of taking half a backup"
+
+cp "$WORK/config.bak" "$CONFIG"
+$CLI backup --dest test >/dev/null 2>&1
+[ "$($CLI snapshots --dest test --json | jq -r '.snapshots[0].paths | length')" = "1" ]
+check $? "and a plain string still works"
+
 # --- listing destinations ---------------------------------------------------
 
 group "Listing destinations"

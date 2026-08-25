@@ -1025,7 +1025,8 @@ cmd_backup() {
   open_log
   progress_init backup "omarchy-time-machine@$DEST_NAME.service"
 
-  local started started_epoch backup_args exclude_file source pattern
+  local started started_epoch backup_args exclude_file pattern entry
+  local -a sources missing
   started="$(date -Iseconds)"
   started_epoch="$(date +%s)"
 
@@ -1044,12 +1045,32 @@ cmd_backup() {
 
   restic_context
 
-  source="$(expand_tilde "$(cfg '.source // empty')")"
-  [ -n "$source" ] || source="$HOME"
+  # restic takes any number of paths, so `source` accepts a string or a list.
+  # A string stays the common case; a list is for the person who wants their
+  # home directory and /etc and a data volume in one snapshot, which restic
+  # deduplicates across all of them anyway.
+  sources=()
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    sources+=("$(expand_tilde "$entry")")
+  done < <(cfg 'if (.source | type) == "array" then .source[] else (.source // empty) end' 2>/dev/null)
+  [ "${#sources[@]}" -gt 0 ] || sources=("$HOME")
+
+  local missing=()
+  for entry in "${sources[@]}"; do
+    [ -e "$entry" ] || missing+=("$entry")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    # Stop rather than quietly snapshot the rest. A source that vanished is
+    # usually an unmounted disk, and a snapshot missing half your files is
+    # worse than no snapshot: retention will happily thin out the good ones
+    # to keep the incomplete ones.
+    die "source does not exist: ${missing[0]}"
+  fi
 
   log_line "=== Time Machine — backup to $DEST_NAME ==="
   log_line "Started: $(date)"
-  log_line "Source:  $source"
+  log_line "Source:  $(printf '%s, ' "${sources[@]}" | sed 's/, $//')"
   log_line "Target:  $REPO_DISPLAY"
   log_line "Log:     $LOG_FILE"
   [ "$OPT_DRY_RUN" = "1" ] && log_line "DRY RUN: nothing will be written"
@@ -1080,7 +1101,7 @@ cmd_backup() {
   [ "$(cfg '.one_file_system // true')" = "true" ] && backup_args+=(--one-file-system)
   [ "$(cfg '.skip_if_unchanged // true')" = "true" ] && backup_args+=(--skip-if-unchanged)
   [ "$OPT_DRY_RUN" = "1" ] && backup_args+=(--dry-run)
-  backup_args+=(-- "$source")
+  backup_args+=(-- "${sources[@]}")
 
   progress_write running backup 1
 
