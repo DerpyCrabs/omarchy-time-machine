@@ -1985,7 +1985,7 @@ verify_unit() {
   cat <<UNIT
 [Unit]
 Description=Verify Time Machine repository %i
-After=network-online.target
+After=network-online.target omarchy-time-machine@%i.service
 Wants=network-online.target
 OnFailure=omarchy-time-machine-maintenance-failed@verify-%i.service
 
