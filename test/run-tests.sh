@@ -520,6 +520,11 @@ $CLI status --json | jq -e '
 ' >/dev/null 2>&1
 check $? "status includes a read-only root system job"
 
+ROOT_BACKUP_SCRIPT="$(dirname "$(dirname "$CLI")")/system/omarchy-system-backup"
+grep -q 'm 0711 "$STATE_DIR"' "$ROOT_BACKUP_SCRIPT" \
+  && grep -q 'm 0700 "$LOG_DIR" "$MANIFEST_DIR" "$CACHE_DIR"' "$ROOT_BACKUP_SCRIPT"
+check $? "the widget can traverse to status while privileged state stays private"
+
 jq 'del(.system_jobs)' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
 
 cp "$WORK/config.bak" "$CONFIG"

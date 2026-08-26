@@ -23,7 +23,11 @@ source "$CONFIG_FILE"
 : "${BACKUP_UUID:?BACKUP_UUID is required}"
 : "${PARTITION_DEVICE:=/dev/nvme0n1}"
 
-install -d -o root -g root -m 0700 "$STATE_DIR" "$LOG_DIR" "$MANIFEST_DIR" "$CACHE_DIR"
+# The desktop widget reads status.json without privileges. Traversal-only on
+# STATE_DIR exposes that one known 0644 file without allowing directory
+# listings; logs, manifests, caches, and their contents stay root-only.
+install -d -o root -g root -m 0711 "$STATE_DIR"
+install -d -o root -g root -m 0700 "$LOG_DIR" "$MANIFEST_DIR" "$CACHE_DIR"
 
 mode="${1:-backup}"
 case "$mode" in
