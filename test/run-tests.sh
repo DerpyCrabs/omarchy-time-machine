@@ -510,15 +510,23 @@ cat > "$SYSTEM_STATUS" <<JSON
 JSON
 jq --arg status "$SYSTEM_STATUS" '.system_jobs = [{
       name:"system-state", display_name:"System state",
+      destination:"test",
       service:"omarchy-system-backup-test.service", status_file:$status
     }]' "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
 
 $CLI status --json | jq -e '
   .system_jobs[0].name == "system-state"
+  and .system_jobs[0].destination == "test"
   and .system_jobs[0].status_only == true
   and .system_jobs[0].last_run.result == "ok"
 ' >/dev/null 2>&1
 check $? "status includes a read-only root system job"
+
+grep -q 'root.browsing ? 520 : 700' "$PANEL" \
+  && grep -q 'TimeMachineStore.systemJobFor(String(modelData.name))' "$PANEL" \
+  && grep -q 'text: "User data"' "$PANEL" \
+  && grep -q 'text: "System state"' "$PANEL"
+check $? "the panel groups user and system state in wide destination cards"
 
 ROOT_BACKUP_SCRIPT="$(dirname "$(dirname "$CLI")")/system/omarchy-system-backup"
 grep -q 'm 0711 "$STATE_DIR"' "$ROOT_BACKUP_SCRIPT" \

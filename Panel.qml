@@ -169,7 +169,7 @@ Panel {
     // fittedContentWidth inside the binding: that form evaluates once at open
     // and never re-runs, so the panel would keep the width of whichever view
     // happened to be showing when it opened.
-    readonly property int desiredWidth: Style.space(root.browsing ? 460 : 320)
+    readonly property int desiredWidth: Style.space(root.browsing ? 520 : 700)
     contentWidth: Math.min(desiredWidth,
                            panel.availableCardWidth > 0 ? panel.availableCardWidth : desiredWidth)
     contentHeight: panel.fittedContentHeight(
@@ -275,182 +275,194 @@ Panel {
             font.pixelSize: Style.font.caption
           }
 
-          // Every destination, always, even when there is only one. One
-          // layout means the panel does not rearrange itself the day you add a
-          // second drive, and "which one is active" stops being a question:
-          // they all run on their own schedule and they all matter.
-          Column {
+          Item {
+            id: destinationCards
             width: parent.width
-            spacing: Style.space(10)
-            bottomPadding: Style.space(12)
+            height: cardsRow.implicitHeight
 
-            Repeater {
-              model: TimeMachineStore.destinations
+            Row {
+              id: cardsRow
+              width: parent.width
+              spacing: Style.space(16)
 
-              Column {
-                width: parent.width
-                spacing: Style.space(4)
+              Repeater {
+                model: TimeMachineStore.destinations
 
-                Item {
-                  width: parent.width
-                  height: Style.space(22)
+                Rectangle {
+                  readonly property var systemJob:
+                    TimeMachineStore.systemJobFor(String(modelData.name))
+                  width: (cardsRow.width
+                          - cardsRow.spacing * Math.max(0, TimeMachineStore.destinations.length - 1))
+                         / Math.max(1, TimeMachineStore.destinations.length)
+                  height: Math.max(cardColumn.implicitHeight + Style.space(24), Style.space(276))
+                  radius: Style.cornerRadius
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
+                  border.width: Math.max(1, Style.space(1))
+                  border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
 
-                  Text {
-                    anchors.left: parent.left
-                    anchors.right: stateText.left
-                    anchors.rightMargin: Style.space(8)
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: TimeMachineStore.destinationLabel(modelData)
-                    textFormat: Text.PlainText
-                    elide: Text.ElideRight
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
+                  Column {
+                    id: cardColumn
+                    anchors.fill: parent
+                    anchors.margins: Style.space(12)
+                    spacing: Style.space(8)
 
-                  Text {
-                    id: stateText
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: TimeMachineStore.destinationState(modelData)
-                    textFormat: Text.PlainText
-                    color: TimeMachineStore.destinationFailed(modelData) ? root.urgent : root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-                }
+                    Item {
+                      width: parent.width
+                      height: Style.space(26)
 
-                // After a failure the useful number is not how big the
-                // repository is, but how old your newest good copy now is.
-                Text {
-                  width: parent.width
-                  visible: text !== ""
-                  text: TimeMachineStore.destinationDetail(modelData)
-                  textFormat: Text.PlainText
-                  elide: Text.ElideRight
-                  color: TimeMachineStore.destinationFailed(modelData) ? root.dim : root.dimmer
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
+                      Text {
+                        anchors.left: parent.left
+                        anchors.right: cardState.left
+                        anchors.rightMargin: Style.space(8)
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: TimeMachineStore.destinationLabel(modelData)
+                        textFormat: Text.PlainText
+                        elide: Text.ElideRight
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                      }
 
-                MenuRow {
-                  width: parent.width
-                  visible: TimeMachineStore.unitsInstalled
-                  // A removable filesystem may be connected but not mounted.
-                  // Starting its guarded unit enters the configured mount path,
-                  // which triggers the UUID-bound systemd automount. If the disk
-                  // is absent, the mount guard fails before restic can write.
-                  enabled: modelData.running
-                           || (!modelData.verifying
-                               && (modelData.repository_available !== false
-                                   || modelData.removable === true))
-                  label: {
-                    var name = TimeMachineStore.destinationLabel(modelData)
-                    if (modelData.running) return "Stop " + name
-                    if (modelData.repository_available === false)
-                      return modelData.removable ? "Mount and back up " + name : name + " is unavailable"
-                    return "Back up " + name + " now"
-                  }
-                  destructive: modelData.running
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: {
-                    if (modelData.running) {
-                      root.pendingStopName = String(modelData.name)
-                      stopConfirm.opened = true
-                    } else {
-                      TimeMachineStore.startOne(String(modelData.name))
+                      Text {
+                        id: cardState
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                          if (modelData.verifying) return "Verifying…"
+                          if (modelData.running) return TimeMachineStore.destinationState(modelData)
+                          if (modelData.repository_available === false) return "Offline"
+                          return "Ready"
+                        }
+                        textFormat: Text.PlainText
+                        color: modelData.repository_available === false ? root.dim : root.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    PanelSeparator { width: parent.width; foreground: root.foreground }
+
+                    Item {
+                      width: parent.width
+                      height: Style.space(22)
+
+                      Text {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "User data"
+                        textFormat: Text.PlainText
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      Text {
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: TimeMachineStore.lastBackupDate(modelData)
+                        textFormat: Text.PlainText
+                        color: TimeMachineStore.destinationFailed(modelData) ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                    }
+
+                    Text {
+                      width: parent.width
+                      text: TimeMachineStore.backupStorageDetail(modelData)
+                      textFormat: Text.PlainText
+                      elide: Text.ElideRight
+                      color: root.dimmer
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Item {
+                      width: parent.width
+                      height: Style.space(22)
+
+                      Text {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "System state"
+                        textFormat: Text.PlainText
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      Text {
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: TimeMachineStore.lastBackupDate(systemJob)
+                        textFormat: Text.PlainText
+                        color: TimeMachineStore.destinationFailed(systemJob) ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                    }
+
+                    Text {
+                      width: parent.width
+                      text: "Root configuration and rebuild manifests"
+                      textFormat: Text.PlainText
+                      elide: Text.ElideRight
+                      color: root.dimmer
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Item { width: 1; height: Style.space(2) }
+
+                    MenuRow {
+                      width: parent.width
+                      visible: TimeMachineStore.unitsInstalled
+                      enabled: modelData.running
+                               || (!modelData.verifying
+                                   && (modelData.repository_available !== false
+                                       || modelData.removable === true))
+                      label: {
+                        if (modelData.running) return "Stop backup"
+                        if (modelData.removable && modelData.repository_available === false)
+                          return "Mount and back up user + system"
+                        return modelData.removable ? "Back up user + system now" : "Back up user data now"
+                      }
+                      destructive: modelData.running
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: {
+                        if (modelData.running) {
+                          root.pendingStopName = String(modelData.name)
+                          stopConfirm.opened = true
+                        } else {
+                          TimeMachineStore.startOne(String(modelData.name))
+                        }
+                      }
+                    }
+
+                    MenuRow {
+                      width: parent.width
+                      visible: TimeMachineStore.unitsInstalled && modelData.removable === true
+                      enabled: !modelData.running && !modelData.verifying
+                      label: modelData.verifying ? "Verifying…" : "Verify user + system"
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: TimeMachineStore.verifyOne(String(modelData.name))
+                    }
+
+                    MenuRow {
+                      width: parent.width
+                      visible: modelData.removable === true
+                               && modelData.repository_available === true
+                               && !modelData.running
+                               && !modelData.verifying
+                      label: "Eject safely"
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: TimeMachineStore.ejectOne(String(modelData.name))
                     }
                   }
-                }
-
-                MenuRow {
-                  width: parent.width
-                  visible: TimeMachineStore.unitsInstalled && modelData.removable === true
-                  enabled: !modelData.running && !modelData.verifying
-                  label: modelData.verifying
-                         ? "Verifying " + TimeMachineStore.destinationLabel(modelData) + "…"
-                         : "Verify " + TimeMachineStore.destinationLabel(modelData)
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: TimeMachineStore.verifyOne(String(modelData.name))
-                }
-
-                MenuRow {
-                  width: parent.width
-                  visible: modelData.removable === true
-                           && modelData.repository_available === true
-                           && !modelData.running
-                           && !modelData.verifying
-                  label: "Eject " + TimeMachineStore.destinationLabel(modelData) + " safely"
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: TimeMachineStore.ejectOne(String(modelData.name))
-                }
-              }
-            }
-          }
-
-          Column {
-            width: parent.width
-            visible: TimeMachineStore.systemJobs.length > 0
-            spacing: Style.space(10)
-            bottomPadding: visible ? Style.space(12) : 0
-
-            Text {
-              width: parent.width
-              text: "System backups"
-              textFormat: Text.PlainText
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
-            Repeater {
-              model: TimeMachineStore.systemJobs
-
-              Column {
-                width: parent.width
-                spacing: Style.space(4)
-
-                Item {
-                  width: parent.width
-                  height: Style.space(22)
-
-                  Text {
-                    anchors.left: parent.left
-                    anchors.right: systemStateText.left
-                    anchors.rightMargin: Style.space(8)
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: TimeMachineStore.destinationLabel(modelData)
-                    textFormat: Text.PlainText
-                    elide: Text.ElideRight
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-
-                  Text {
-                    id: systemStateText
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: TimeMachineStore.destinationState(modelData)
-                    textFormat: Text.PlainText
-                    color: TimeMachineStore.destinationFailed(modelData) ? root.urgent : root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-                }
-
-                Text {
-                  width: parent.width
-                  visible: text !== ""
-                  text: TimeMachineStore.destinationDetail(modelData)
-                  textFormat: Text.PlainText
-                  elide: Text.ElideRight
-                  color: root.dimmer
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
                 }
               }
             }
@@ -497,26 +509,6 @@ Panel {
           }
 
           // --- actions -----------------------------------------------------
-
-          PanelSeparator { width: parent.width; foreground: root.foreground }
-
-          MenuRow {
-            width: parent.width
-            visible: TimeMachineStore.configured && TimeMachineStore.unitsInstalled
-            enabled: !TimeMachineStore.userVerificationsRunning
-            label: TimeMachineStore.userBackupsRunning ? "Stop Running Backups" : "Back Up Now"
-            destructive: TimeMachineStore.userBackupsRunning
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            onClicked: {
-              if (TimeMachineStore.userBackupsRunning) {
-                root.pendingStopName = ""
-                stopConfirm.opened = true
-              } else {
-                TimeMachineStore.startAllBackups()
-              }
-            }
-          }
 
           // Rather than an action that silently does nothing, say what is
           // missing. This is the state every fresh install starts in.

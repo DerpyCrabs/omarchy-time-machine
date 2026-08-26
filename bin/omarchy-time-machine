@@ -351,6 +351,9 @@ config_problem() {
     and all((.system_jobs // [])[];
       (.name | type) == "string"
       and (.name | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+      and ((.destination == null)
+           or ((.destination | type) == "string"
+               and (.destination | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))))
       and (.service | type) == "string"
       and (.service | test("^[A-Za-z0-9@_.:-]+\\.service$"))
       and (.status_file | type) == "string"
@@ -953,11 +956,12 @@ cmd_destinations() {
 }
 
 system_jobs_status() {
-  local out='[]' job name label service status_file stored running
+  local out='[]' job name label destination service status_file stored running
   while IFS= read -r job; do
     [ -n "$job" ] || continue
     name="$(jq -r '.name' <<<"$job")"
     label="$(jq -r '.display_name // .name' <<<"$job")"
+    destination="$(jq -r '.destination // empty' <<<"$job")"
     service="$(jq -r '.service' <<<"$job")"
     status_file="$(jq -r '.status_file' <<<"$job")"
     stored="$(read_json_or "$status_file" '{}')"
@@ -966,10 +970,12 @@ system_jobs_status() {
     out="$(jq -c \
       --arg name "$name" \
       --arg label "$label" \
+      --arg destination "$destination" \
       --arg service "$service" \
       --argjson stored "$stored" \
       --argjson running "$running" \
-      '. + [$stored + {name:$name, display_name:$label, service:$service,
+      '. + [$stored + {name:$name, display_name:$label,
+                       destination:(if $destination == "" then null else $destination end), service:$service,
                        running:$running, status_only:true}]' <<<"$out")"
   done < <(cfg '.system_jobs[]? | @json' 2>/dev/null)
   printf '%s' "$out"

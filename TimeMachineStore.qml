@@ -208,6 +208,31 @@ Singleton {
     return d.display_name ? String(d.display_name) : String(d.name)
   }
 
+  function systemJobFor(destinationName) {
+    for (var i = 0; i < systemJobs.length; i++) {
+      if (String(systemJobs[i].destination || "") === String(destinationName))
+        return systemJobs[i]
+    }
+    return null
+  }
+
+  function lastBackupDate(d) {
+    clockTick
+    if (!d || !d.last_success_at) return "Never"
+    return menuDate(d.last_success_at)
+  }
+
+  function backupStorageDetail(d) {
+    if (!d) return ""
+    var parts = []
+    if (d.repo_size_bytes)
+      parts.push(humanBytes(d.repo_size_bytes)
+                 + (d.snapshot_count ? " in " + d.snapshot_count + " snapshots" : ""))
+    if (d.last_run && d.last_run.data_added_bytes)
+      parts.push(humanBytes(d.last_run.data_added_bytes) + " added")
+    return parts.join(" \u00b7 ")
+  }
+
   // Something to read while it works. A progress bar that says "Backing up"
   // for four minutes tells you nothing you did not already know, and the
   // Dropbox widget in this shell has been doing this for ages, so it is a
@@ -306,7 +331,7 @@ Singleton {
   }
 
   function destinationFailed(d) {
-    return d.last_run ? d.last_run.result === "failed" : false
+    return d && d.last_run ? d.last_run.result === "failed" : false
   }
 
   function startBackup() {
