@@ -1,0 +1,16 @@
+[Unit]
+Description=Verify Omarchy system state on the detached SSD
+Documentation=https://github.com/DerpyCrabs/omarchy-time-machine
+After=local-fs.target
+RequiresMountsFor=/mnt/offline-backup
+
+[Service]
+Type=oneshot
+Environment=OMARCHY_SYSTEM_BACKUP_CONFIG=/etc/omarchy-system-backup-offline.conf
+Environment=OMARCHY_SYSTEM_BACKUP_STATE_DIR=/var/lib/omarchy-system-backup-offline
+Environment=OMARCHY_SYSTEM_BACKUP_CACHE_DIR=/var/cache/omarchy-system-backup-offline
+ExecStart=/usr/local/libexec/omarchy-system-backup check
+ExecStart=/usr/local/libexec/omarchy-system-backup restore-test
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle

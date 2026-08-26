@@ -191,6 +191,11 @@ OUT="$($CLI verify-restore --dest test 2>&1)"
 [ $? -eq 0 ] && grep -q '^Verified 1 item' <<<"$OUT"
 check $? "a restored sample is compared before success is reported"
 
+OUT="$($CLI verify --dest test 2>&1)"
+[ $? -eq 0 ] && grep -q 'no errors were found' <<<"$OUT" \
+  && grep -q '^Verified 1 item' <<<"$OUT"
+check $? "verify combines a repository check with a sample restore"
+
 mkdir -p "$WORK/locked"
 chmod 0500 "$WORK/locked"
 jq --arg root "$WORK/locked/child" '.restore_test.root = $root' \
@@ -383,7 +388,8 @@ check $? "a fresh progress file is"
 group "systemd units"
 
 $CLI install >/dev/null 2>&1
-for unit in "omarchy-time-machine@.service" "omarchy-time-machine-failed@.service" "omarchy-time-machine@test.timer"; do
+for unit in "omarchy-time-machine@.service" "omarchy-time-machine-failed@.service" \
+            "omarchy-time-machine-verify@.service" "omarchy-time-machine@test.timer"; do
   [ -f "$XDG_CONFIG_HOME/systemd/user/$unit" ]
   check $? "install writes $unit"
 done
@@ -400,7 +406,7 @@ check $? "the service does not excuse restic exit 3"
 # install exits non-zero here because systemd cannot enable a unit under a
 # redirected XDG_CONFIG_HOME. What is under test is that it rewrites nothing.
 OUT="$($CLI install 2>&1)"
-[ "$(grep -c 'unchanged' <<<"$OUT")" = "7" ]
+[ "$(grep -c 'unchanged' <<<"$OUT")" = "8" ]
 check $? "install rewrites nothing on a second run"
 
 if command -v systemd-analyze >/dev/null 2>&1; then
@@ -483,6 +489,10 @@ grep -q 'function stopOne(name)' "$STORE"
 check $? "a destination can be stopped by name"
 grep -q 'TimeMachineStore.startOne(String(modelData.name))' "$PANEL"
 check $? "the panel exposes a per-destination backup action"
+
+grep -q 'TimeMachineStore.verifyOne(String(modelData.name))' "$PANEL" \
+  && grep -q 'omarchy-time-machine-verify@' "$STORE"
+check $? "the panel exposes a per-destination verification action"
 
 grep -q 'modelData.removable === true' "$PANEL" \
   && grep -q 'Mount and back up' "$PANEL"

@@ -169,12 +169,12 @@ Panel {
     // fittedContentWidth inside the binding: that form evaluates once at open
     // and never re-runs, so the panel would keep the width of whichever view
     // happened to be showing when it opened.
-    readonly property int desiredWidth: Style.space(root.browsing ? 460 : 280)
+    readonly property int desiredWidth: Style.space(root.browsing ? 460 : 320)
     contentWidth: Math.min(desiredWidth,
                            panel.availableCardWidth > 0 ? panel.availableCardWidth : desiredWidth)
     contentHeight: panel.fittedContentHeight(
                      root.browsing ? browser.implicitHeight : mainColumn.implicitHeight,
-                     Style.space(560))
+                     Style.space(620))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -240,10 +240,11 @@ Panel {
 
           Text {
             width: parent.width
-            bottomPadding: Style.space(8)
+            bottomPadding: Style.space(12)
             text: {
               if (TimeMachineStore.configInvalid) return "There is a problem with your configuration"
               if (!TimeMachineStore.configured) return "No backups are set up yet"
+              if (TimeMachineStore.userVerificationsRunning) return "Verifying backups"
               if (TimeMachineStore.anyRunning) return "Backing up"
               if (TimeMachineStore.anyFailed) return "A backup failed"
               return "Backups"
@@ -280,19 +281,19 @@ Panel {
           // they all run on their own schedule and they all matter.
           Column {
             width: parent.width
-            spacing: Style.space(6)
-            bottomPadding: Style.space(8)
+            spacing: Style.space(10)
+            bottomPadding: Style.space(12)
 
             Repeater {
               model: TimeMachineStore.destinations
 
               Column {
                 width: parent.width
-                spacing: Style.space(1)
+                spacing: Style.space(4)
 
                 Item {
                   width: parent.width
-                  height: Style.space(18)
+                  height: Style.space(22)
 
                   Text {
                     anchors.left: parent.left
@@ -340,8 +341,9 @@ Panel {
                   // which triggers the UUID-bound systemd automount. If the disk
                   // is absent, the mount guard fails before restic can write.
                   enabled: modelData.running
-                           || modelData.repository_available !== false
-                           || modelData.removable === true
+                           || (!modelData.verifying
+                               && (modelData.repository_available !== false
+                                   || modelData.removable === true))
                   label: {
                     var name = TimeMachineStore.destinationLabel(modelData)
                     if (modelData.running) return "Stop " + name
@@ -364,9 +366,22 @@ Panel {
 
                 MenuRow {
                   width: parent.width
+                  visible: TimeMachineStore.unitsInstalled && modelData.removable === true
+                  enabled: !modelData.running && !modelData.verifying
+                  label: modelData.verifying
+                         ? "Verifying " + TimeMachineStore.destinationLabel(modelData) + "…"
+                         : "Verify " + TimeMachineStore.destinationLabel(modelData)
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: TimeMachineStore.verifyOne(String(modelData.name))
+                }
+
+                MenuRow {
+                  width: parent.width
                   visible: modelData.removable === true
                            && modelData.repository_available === true
                            && !modelData.running
+                           && !modelData.verifying
                   label: "Eject " + TimeMachineStore.destinationLabel(modelData) + " safely"
                   foreground: root.foreground
                   fontFamily: root.fontFamily
@@ -379,8 +394,8 @@ Panel {
           Column {
             width: parent.width
             visible: TimeMachineStore.systemJobs.length > 0
-            spacing: Style.space(6)
-            bottomPadding: visible ? Style.space(8) : 0
+            spacing: Style.space(10)
+            bottomPadding: visible ? Style.space(12) : 0
 
             Text {
               width: parent.width
@@ -396,11 +411,11 @@ Panel {
 
               Column {
                 width: parent.width
-                spacing: Style.space(1)
+                spacing: Style.space(4)
 
                 Item {
                   width: parent.width
-                  height: Style.space(18)
+                  height: Style.space(22)
 
                   Text {
                     anchors.left: parent.left
@@ -445,7 +460,7 @@ Panel {
 
           Rectangle {
             width: parent.width
-            visible: TimeMachineStore.running
+            visible: TimeMachineStore.userBackupsRunning
             height: visible ? Style.space(3) : 0
             radius: height / 2
             color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
@@ -465,7 +480,7 @@ Panel {
 
           Text {
             width: parent.width
-            visible: TimeMachineStore.running && text !== ""
+            visible: TimeMachineStore.userBackupsRunning && text !== ""
             topPadding: visible ? Style.space(4) : 0
             bottomPadding: visible ? Style.space(4) : 0
             text: {
@@ -488,6 +503,7 @@ Panel {
           MenuRow {
             width: parent.width
             visible: TimeMachineStore.configured && TimeMachineStore.unitsInstalled
+            enabled: !TimeMachineStore.userVerificationsRunning
             label: TimeMachineStore.userBackupsRunning ? "Stop Running Backups" : "Back Up Now"
             destructive: TimeMachineStore.userBackupsRunning
             foreground: root.foreground

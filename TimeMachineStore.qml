@@ -136,6 +136,7 @@ Singleton {
   // any locking of our own.
   Process { id: startProc }
   Process { id: startAllProc }
+  Process { id: verifyProc }
   Process { id: stopProc }
   Process { id: ejectProc; stdout: StdioCollector { onStreamFinished: root.refresh() } }
   Process { id: useProc; stdout: StdioCollector { onStreamFinished: root.refresh() } }
@@ -149,7 +150,7 @@ Singleton {
     var command = ["systemctl", "--user", "start", "--no-block"]
     for (var i = 0; i < destinations.length; i++) {
       var d = destinations[i]
-      if (d.running || d.repository_available === false) continue
+      if (d.running || d.verifying || d.repository_available === false) continue
       command.push("omarchy-time-machine@" + String(d.name) + ".service")
     }
     if (command.length === 4) return
@@ -164,14 +165,27 @@ Singleton {
     startProc.running = true
   }
 
+  function verifyOne(name) {
+    verifyProc.command = ["systemctl", "--user", "start", "--no-block",
+                          "omarchy-time-machine-verify@" + name + ".service"]
+    verifyProc.running = true
+    kickPoll.restart()
+  }
+
   readonly property bool userBackupsRunning: {
     for (var i = 0; i < destinations.length; i++)
       if (destinations[i].running) return true
     return false
   }
 
+  readonly property bool userVerificationsRunning: {
+    for (var i = 0; i < destinations.length; i++)
+      if (destinations[i].verifying) return true
+    return false
+  }
+
   readonly property bool anyRunning: {
-    if (userBackupsRunning) return true
+    if (userBackupsRunning || userVerificationsRunning) return true
     for (var j = 0; j < systemJobs.length; j++)
       if (systemJobs[j].running) return true
     return false
@@ -238,6 +252,7 @@ Singleton {
 
   function destinationState(d) {
     clockTick
+    if (d.verifying) return "Verifying…"
     if (d.running) {
       var p = d.progress
       if (p && p.percent !== undefined && p.percent !== null)
@@ -258,6 +273,7 @@ Singleton {
   // you can see the backup is still incremental and the disk is not filling.
   function destinationDetail(d) {
     clockTick
+    if (d.verifying) return "Checking the repository and restoring test files…"
     if (d.running) {
       var p = d.progress
       var phase = p ? String(p.phase) : ""

@@ -998,7 +998,7 @@ cmd_status() {
   fi
   load_config
 
-  local status active out name progress running epoch age updated installed repo
+  local status active out name progress running verifying epoch age updated installed repo
   local removable eject_path system_jobs
   status="$(load_status)"
   epoch="$(date +%s)"
@@ -1030,6 +1030,10 @@ cmd_status() {
     if systemctl --user --quiet is-active "omarchy-time-machine@$name.service" 2>/dev/null; then
       running=true
     fi
+    verifying=false
+    if systemctl --user --quiet is-active "omarchy-time-machine-verify@$name.service" 2>/dev/null; then
+      verifying=true
+    fi
 
     repo="$(sanitize_repository "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .repository // ""' <<<"$CONFIG_JSON")")"
     destination_availability
@@ -1043,6 +1047,7 @@ cmd_status() {
       --argjson stored "$(jq -c --arg n "$name" '.destinations[$n] // {}' <<<"$status")" \
       --arg schedule "$(jq -r --arg n "$name" '.destinations[] | select(.name==$n) | .schedule // ""' <<<"$CONFIG_JSON")" \
       --argjson running "$running" \
+      --argjson verifying "$verifying" \
       --argjson available "$DESTINATION_AVAILABLE" \
       --argjson removable "$removable" \
       --arg eject_path "$eject_path" \
@@ -1050,6 +1055,7 @@ cmd_status() {
       '. + [$stored + {name:$name, display_name:$label,
                        schedule:(if $schedule == "" then null else $schedule end),
                        running:$running,
+                       verifying:$verifying,
                        repository_available:$available,
                        removable:$removable,
                        eject_path:(if $eject_path == "" then null else $eject_path end),
@@ -1093,6 +1099,14 @@ cmd_check() {
     args+=("--read-data-subset=$OPT_READ_DATA_SUBSET")
   fi
   restic_run "${args[@]}"
+}
+
+cmd_verify() {
+  # Use the same operations as scheduled maintenance. The check catches
+  # damaged repository structure; the restore proves configured samples can
+  # be recovered elsewhere and still match their source.
+  cmd_check "$@" || return 1
+  cmd_verify_restore "$@"
 }
 
 cmd_verify_restore() {
@@ -1163,6 +1177,9 @@ cmd_eject() {
 
   if systemctl --user --quiet is-active "omarchy-time-machine@$DEST_NAME.service" 2>/dev/null; then
     die "backup to $DEST_NAME is still running"
+  fi
+  if systemctl --user --quiet is-active "omarchy-time-machine-verify@$DEST_NAME.service" 2>/dev/null; then
+    die "verification of $DEST_NAME is still running"
   fi
 
   progress="$(read_json_or "$STATE_DIR/progress-$DEST_NAME.json" 'null')"
@@ -1964,6 +1981,24 @@ IOSchedulingClass=idle
 UNIT
 }
 
+verify_unit() {
+  cat <<UNIT
+[Unit]
+Description=Verify Time Machine repository %i
+After=network-online.target
+Wants=network-online.target
+OnFailure=omarchy-time-machine-maintenance-failed@verify-%i.service
+
+[Service]
+Type=oneshot
+Environment=PATH=$(unit_path_env)
+ExecStart=$SELF verify --dest %i
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle
+UNIT
+}
+
 maintenance_failed_unit() {
   cat <<UNIT
 [Unit]
@@ -2042,6 +2077,7 @@ cmd_install() {
   write_unit "omarchy-time-machine-check@.service" "$(check_unit)"
   write_unit "omarchy-time-machine-check-data@.service" "$(check_unit '--read-data-subset 5%%')"
   write_unit "omarchy-time-machine-restore-test@.service" "$(restore_test_unit)"
+  write_unit "omarchy-time-machine-verify@.service" "$(verify_unit)"
   write_unit "omarchy-time-machine-maintenance-failed@.service" "$(maintenance_failed_unit)"
 
   local names=() maintenance_units=() name schedule delay unit path filename keep
@@ -2319,6 +2355,7 @@ omarchy-time-machine $VERSION
   restore --dest <name> --snapshot <id> --path </abs> [--target <dir>]
   check --dest <name>                 verify repository integrity
         [--read-data-subset 5%]
+  verify --dest <name>                check repository and test configured restores
   verify-restore --dest <name>        restore configured samples elsewhere and compare
   eject --dest <name> [--json]        unmount and power off a removable destination
   install                             (re)write and enable the systemd units
@@ -2343,6 +2380,7 @@ main() {
     ls) need restic; cmd_ls "$@" ;;
     restore) need restic; cmd_restore "$@" ;;
     check) need restic; cmd_check "$@" ;;
+    verify) need restic; need diff; cmd_verify "$@" ;;
     verify-restore) need restic; need diff; cmd_verify_restore "$@" ;;
     eject) need findmnt; need lsblk; need udisksctl; cmd_eject "$@" ;;
     install) cmd_install "$@" ;;
